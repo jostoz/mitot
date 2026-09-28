@@ -59,6 +59,7 @@ model WhatsAppGroup {
   messages    DeckMessage[]
   discussions DiscussionThread[]
   notifications Notification[]
+  matchDecisions MatchDecision[]
   createdAt   DateTime           @default(now())
 }
 
@@ -91,6 +92,8 @@ model DiscussionThread {
   priority       String?
   messages       DeckMessage[]
   notifications  Notification[]
+  corrections    RoutingCorrection[] @relation("CorrectionTarget")
+  matchDecisions MatchDecision[]     @relation("MatchDecisionThread")
   lastActivityAt DateTime
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
@@ -119,6 +122,8 @@ model DeckMessage {
   timestamp       DateTime
   media           MediaAsset?
   createdAt       DateTime          @default(now())
+  corrections    RoutingCorrection[]
+  matchDecision  MatchDecision?
 
   @@index([groupId, columnId, createdAt(sort: Desc)])
   @@index([discussionId, createdAt(sort: Desc)])
@@ -149,4 +154,47 @@ model Notification {
   createdAt    DateTime          @default(now())
 
   @@index([groupId, read, createdAt(sort: Desc)])
+}
+
+/// Corrección manual de enrutado. Además de arreglar el hilo, deja un caso
+/// etiquetado por humano para evaluar cambios futuros del clasificador.
+model RoutingCorrection {
+  id           String            @id @default(uuid())
+  groupId      String
+  messageId    String
+  message      DeckMessage       @relation(fields: [messageId], references: [id])
+  fromThreadId String?
+  toThreadId   String?
+  toThread     DiscussionThread? @relation("CorrectionTarget", fields: [toThreadId], references: [id])
+  correctedBy  String?
+  createdAt    DateTime          @default(now())
+
+  @@index([groupId, createdAt(sort: Desc)])
+  @@index([messageId])
+}
+
+/// Una fila por mensaje procesado por el pipeline de enrutado: qué decidió el matcher,
+/// con qué confianza y bajo qué versión de prompt. Cruzado con RoutingCorrection
+/// (messageId) da la tasa de acierto real por versión de prompt, sin depender de que
+/// alguien reporte el error a ojo.
+model MatchDecision {
+  id              String            @id @default(uuid())
+  groupId         String
+  group           WhatsAppGroup     @relation(fields: [groupId], references: [id])
+  messageId       String            @unique
+  message         DeckMessage       @relation(fields: [messageId], references: [id])
+  promptVersion   String
+  /// "citation" (determinista, cita a un mensaje con hilo) | "typesafe" (matcher
+  /// probabilístico) | "noise" (fue a Sin tema)
+  method          String
+  category        MessageCategory
+  matchedThreadId String?
+  matchedThread   DiscussionThread? @relation("MatchDecisionThread", fields: [matchedThreadId], references: [id])
+  isNewTopic      Boolean
+  confidence      Float?
+  candidateCount  Int
+  createdAt       DateTime          @default(now())
+
+  @@index([groupId, createdAt(sort: Desc)])
+  @@index([promptVersion])
 }

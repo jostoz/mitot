@@ -16,7 +16,11 @@ const outbound = new Queue("whatsapp-outbound", { connection: redis });
 const enrichment = new Queue("message-enrichment", { connection: redis });
 const clients = new Set<{ send(data: string): void; readyState: number }>();
 const ReplySchema = z.object({ content: z.string().trim().min(1).max(4096), parentMessageId: z.string().min(1).optional() });
-const DiscussionUpdateSchema = z.object({ status: z.enum(["PROPOSED", "ACTIVE"]).optional(), ownerName: z.string().trim().min(1).max(120).nullable().optional(), nextAction: z.string().trim().min(1).max(4096).nullable().optional(), followUpAt: z.coerce.date().nullable().optional(), priority: z.enum(["LOW", "MEDIUM", "HIGH", "URGENT"]).nullable().optional() }).refine((value) => Object.keys(value).length > 0);
+const DiscussionUpdateSchema = z.object({ status: z.enum(["PROPOSED", "ACTIVE"]).optional(), visibility: z.enum(["PRIVATE", "MEMBERS", "PUBLIC"]).optional(), ownerName: z.string().trim().min(1).max(120).nullable().optional(), nextAction: z.string().trim().min(1).max(4096).nullable().optional(), followUpAt: z.coerce.date().nullable().optional(), priority: z.enum(["LOW", "MEDIUM", "HIGH", "URGENT"]).nullable().optional() }).refine((value) => Object.keys(value).length > 0);
+const MessageRouteSchema = z.object({
+  discussionId: z.string().min(1).nullable(),
+  correctedBy: z.string().trim().min(1).max(120).optional(),
+});
 const ManualMessageSchema = z.object({
   senderName: z.string().trim().min(1).max(120),
   content: z.string().trim().min(1).max(4096),
@@ -59,9 +63,23 @@ app.get("/groups/:groupId/discussions", async (request) => {
     include: { messages: { orderBy: [{ timestamp: "asc" }, { id: "asc" }] } },
   });
 });
-app.get("/public/groups/:groupId/discussions", async (request) => {
+app.get("/public/groups/:groupId/discussions", async (request, reply) => {
   const { groupId } = request.params as { groupId: string };
-  return prisma.$queryRaw`SELECT id, title, summary, "lastActivityAt" FROM "DiscussionThread" WHERE "groupId" = ${groupId} AND visibility = 'PUBLIC' ORDER BY "lastActivityAt" DESC`;
+  const group = await prisma.whatsAppGroup.findUnique({ where: { id: groupId }, select: { name: true, isActive: true } });
+  if (!group?.isActive) return reply.code(404).send({ error: "Group not found" });
+  const discussions = await prisma.discussionThread.findMany({
+    where: { groupId, visibility: "PUBLIC" },
+    orderBy: { lastActivityAt: "desc" },
+    select: {
+      id: true,
+      title: true,
+      summary: true,
+      lastActivityAt: true,
+      // Sin nombres de remitente: la página es pública y el grupo no consintió exponerlos.
+      messages: { orderBy: { timestamp: "asc" }, select: { id: true, content: true, timestamp: true, metadata: true } },
+    },
+  });
+  return reply.send({ group: { name: group.name }, discussions });
 });
 app.post("/groups/:groupId/replies", async (request, reply) => {
   const { groupId } = request.params as { groupId: string };
@@ -87,7 +105,107 @@ app.post("/groups/:groupId/manual-messages", async (request, reply) => {
 app.patch("/discussions/:id", async (request, reply) => {
   const { id } = request.params as { id: string };
   const data = DiscussionUpdateSchema.parse(request.body);
+  if (data.visibility === "PUBLIC") {
+    const thread = await prisma.discussionThread.findUnique({ where: { id }, select: { topicKey: true } });
+    // El bucket de ruido acumula bromas y reacciones: publicarlo expone al grupo sin aportar valor.
+    if (thread?.topicKey === "off-topic") {
+      return reply.code(400).send({ error: "El hilo sin tema no puede publicarse" });
+    }
+  }
   return reply.send(await prisma.discussionThread.update({ where: { id }, data }));
+});
+app.patch("/messages/:id/discussion", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { discussionId, correctedBy } = MessageRouteSchema.parse(request.body);
+  const message = await prisma.deckMessage.findUnique({
+    where: { id },
+    select: { id: true, groupId: true, discussionId: true },
+  });
+  if (!message) return reply.code(404).send({ error: "Message not found" });
+
+  if (discussionId) {
+    const target = await prisma.discussionThread.findUnique({ where: { id: discussionId }, select: { groupId: true } });
+    if (!target) return reply.code(404).send({ error: "Discussion not found" });
+    if (target.groupId !== message.groupId) return reply.code(400).send({ error: "Discussion belongs to another group" });
+  }
+
+  const [updated] = await prisma.$transaction([
+    prisma.deckMessage.update({ where: { id }, data: { discussionId } }),
+    prisma.routingCorrection.create({
+      data: { groupId: message.groupId, messageId: id, fromThreadId: message.discussionId, toThreadId: discussionId, correctedBy },
+    }),
+  ]);
+
+  // El hilo de origen puede quedar vacío tras mover su último mensaje.
+  if (message.discussionId && message.discussionId !== discussionId) {
+    const remaining = await prisma.deckMessage.count({ where: { discussionId: message.discussionId } });
+    if (!remaining) {
+      await prisma.notification.deleteMany({ where: { discussionId: message.discussionId } });
+      await prisma.routingCorrection.updateMany({ where: { toThreadId: message.discussionId }, data: { toThreadId: null } });
+      await prisma.discussionThread.delete({ where: { id: message.discussionId } });
+    }
+  }
+  if (discussionId) {
+    await prisma.discussionThread.update({ where: { id: discussionId }, data: { lastActivityAt: new Date() } });
+  }
+
+  await redis.publish("deck-events", JSON.stringify({ type: "message.rerouted", messageId: id }));
+  return reply.send(updated);
+});
+app.get("/groups/:groupId/observability", async (request) => {
+  const { groupId } = request.params as { groupId: string };
+  const [decisions, corrections] = await Promise.all([
+    prisma.matchDecision.findMany({
+      where: { groupId },
+      select: { messageId: true, promptVersion: true, method: true, category: true, isNewTopic: true, confidence: true },
+    }),
+    prisma.routingCorrection.findMany({ where: { groupId }, select: { messageId: true } }),
+  ]);
+  const correctedIds = new Set(corrections.map((c) => c.messageId));
+
+  type Bucket = {
+    total: number;
+    correctedCount: number;
+    confidenceSum: number;
+    confidenceCount: number;
+    newTopicCount: number;
+    typesafeCount: number;
+    methodCounts: Record<string, number>;
+    categoryCounts: Record<string, number>;
+  };
+  const byVersion = new Map<string, Bucket>();
+  for (const d of decisions) {
+    const bucket = byVersion.get(d.promptVersion) ?? {
+      total: 0, correctedCount: 0, confidenceSum: 0, confidenceCount: 0, newTopicCount: 0, typesafeCount: 0, methodCounts: {}, categoryCounts: {},
+    };
+    bucket.total += 1;
+    if (correctedIds.has(d.messageId)) bucket.correctedCount += 1;
+    bucket.methodCounts[d.method] = (bucket.methodCounts[d.method] ?? 0) + 1;
+    bucket.categoryCounts[d.category] = (bucket.categoryCounts[d.category] ?? 0) + 1;
+    if (d.method === "typesafe") {
+      bucket.typesafeCount += 1;
+      if (d.confidence != null) {
+        bucket.confidenceSum += d.confidence;
+        bucket.confidenceCount += 1;
+      }
+      if (d.isNewTopic) bucket.newTopicCount += 1;
+    }
+    byVersion.set(d.promptVersion, bucket);
+  }
+
+  const versions = [...byVersion.entries()]
+    .map(([promptVersion, b]) => ({
+      promptVersion,
+      total: b.total,
+      correctedCount: b.correctedCount,
+      overrideRate: b.total ? b.correctedCount / b.total : 0,
+      avgConfidence: b.confidenceCount ? b.confidenceSum / b.confidenceCount : null,
+      newTopicRate: b.typesafeCount ? b.newTopicCount / b.typesafeCount : null,
+      methodCounts: b.methodCounts,
+      categoryCounts: b.categoryCounts,
+    }))
+    .sort((a, b) => b.total - a.total);
+  return { versions };
 });
 app.get("/groups/:groupId/notifications", async (request) => {
   const { groupId } = request.params as { groupId: string };
