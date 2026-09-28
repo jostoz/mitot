@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { mkdir, writeFile } from "node:fs/promises";
+import { cp, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion, makeWASocket, useMultiFileAuthState, type GroupMetadata, type WAMessage } from "@whiskeysockets/baileys";
 import { Queue, Worker } from "bullmq";
@@ -78,8 +78,37 @@ async function saveMedia(message: WAMessage, detected: { field: string; kind: Me
   }
 }
 
+const AUTH_DIR = process.env.WHATSAPP_AUTH_DIR ?? ".wa-auth";
+const AUTH_BACKUP_DIR = process.env.WHATSAPP_AUTH_BACKUP_DIR ?? `${AUTH_DIR}.backup`;
+let starting = false;
+let lastBackupAt = 0;
+
+async function backupAuthState() {
+  const now = Date.now();
+  if (now - lastBackupAt < 5 * 60_000) return;
+  lastBackupAt = now;
+  try {
+    await cp(AUTH_DIR, AUTH_BACKUP_DIR, { recursive: true });
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Failed to back up WhatsApp session:`, error);
+  }
+}
+
 async function start() {
-  const { state, saveCreds } = await useMultiFileAuthState(process.env.WHATSAPP_AUTH_DIR ?? ".wa-auth");
+  if (starting) return;
+  starting = true;
+  try {
+    await startSocket();
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Fatal error starting WhatsApp socket, exiting for supervisor restart:`, error);
+    process.exit(1);
+  } finally {
+    starting = false;
+  }
+}
+
+async function startSocket() {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
   let groupMetadataCache = new Map<string, GroupMetadata>();
   const socket = makeWASocket({
@@ -87,7 +116,7 @@ async function start() {
     cachedGroupMetadata: async (jid) => groupMetadataCache.get(jid),
   });
 
-  socket.ev.on("creds.update", saveCreds);
+  socket.ev.on("creds.update", async () => { await saveCreds(); void backupAuthState(); });
   socket.ev.on("connection.update", ({ connection, lastDisconnect, qr: pairingQr }) => {
     if (connection === "open") {
       health.state = "open";
@@ -161,6 +190,6 @@ async function start() {
 
   process.once("SIGINT", async () => { await Promise.all([enrichmentQueue.close(), outboundQueue.close(), redis.quit()]); process.exit(0); });
 }
-process.on("uncaughtException", (error) => console.error("Uncaught exception (ingest kept running):", error));
-process.on("unhandledRejection", (error) => console.error("Unhandled rejection (ingest kept running):", error));
+process.on("uncaughtException", (error) => { console.error(`[${new Date().toISOString()}] Uncaught exception, exiting for supervisor restart:`, error); process.exit(1); });
+process.on("unhandledRejection", (error) => { console.error(`[${new Date().toISOString()}] Unhandled rejection, exiting for supervisor restart:`, error); process.exit(1); });
 void start();

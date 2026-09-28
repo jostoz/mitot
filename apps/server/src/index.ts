@@ -32,6 +32,16 @@ app.setErrorHandler((error, _request, reply) => {
 });
 
 app.get("/health", async () => ({ ok: true }));
+app.get("/ingest-status", async (_request, reply) => {
+  try {
+    const url = process.env.INGEST_STATUS_URL ?? "http://127.0.0.1:3002/status";
+    const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    return reply.send(await res.json());
+  } catch {
+    return reply.send({ state: "unreachable", connectedAt: null, lastMessageAt: null, lastCloseReason: null, reconnects: null });
+  }
+});
 app.get("/groups", async () => prisma.whatsAppGroup.findMany({ where: { isActive: true }, orderBy: { name: "asc" }, include: { columns: { orderBy: { createdAt: "asc" } } } }));
 app.get("/groups/:groupId/messages", async (request) => {
   const { groupId } = request.params as { groupId: string };

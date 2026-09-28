@@ -1,8 +1,9 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import { Bell, Check, ChevronLeft, ChevronRight, Clock3, FileText, Home, LayoutGrid, MessageCircle, MoreHorizontal, Repeat2, Send, Sparkles, User, X } from "lucide-react";
+import { AlertTriangle, Bell, Check, ChevronLeft, ChevronRight, Clock3, FileText, Home, LayoutGrid, MessageCircle, MoreHorizontal, Repeat2, Send, Sparkles, User, WifiOff, X } from "lucide-react";
 import { type Discussion, type Group, type MediaInfo, type Notification, useDeckStore } from "./store";
 const API = "/api";
+type IngestStatus = { state: "connecting" | "open" | "closed" | "unreachable"; lastMessageAt: string | null };
 const PALETTE = ["#7c6cff", "#ff6c8b", "#3ecf8e", "#f2b705", "#4ea1ff", "#ff9f4e"];
 function avatarColor(name: string) {
   let h = 0;
@@ -175,11 +176,34 @@ function NotificationBell({ notifications, onOpen, onRead }: { notifications: No
   );
 }
 
+function IngestIndicator({ status }: { status: IngestStatus | null }) {
+  const [open, setOpen] = useState(false);
+  const healthy = status?.state === "open";
+  const label = !status ? "Checking WhatsApp connection…" : status.state === "open" ? "WhatsApp connected" : status.state === "unreachable" ? "WhatsApp listener unreachable" : "WhatsApp disconnected — reconnecting";
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen(!open)} title={label} className={`flex size-11 items-center justify-center rounded-full hover:bg-white/[0.08] lg:size-10 ${healthy ? "text-[#3ecf8e]" : "text-[#ff6c8b]"}`}>
+        {healthy ? <Check className="size-5" /> : status?.state === "unreachable" ? <AlertTriangle className="size-5" /> : <WifiOff className="size-5" />}
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          <div className="fixed bottom-16 left-2 right-2 z-20 rounded-xl border border-[#2f3336] bg-[#16181c] p-3 text-sm shadow-2xl lg:absolute lg:bottom-auto lg:left-14 lg:right-auto lg:top-0 lg:w-64">
+            <p className={healthy ? "text-[#3ecf8e]" : "text-[#ff6c8b]"}>{label}</p>
+            {status?.lastMessageAt && <p className="mt-1 text-xs text-[#8b98a5]">Last message: {relTime(status.lastMessageAt)} ago</p>}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function Page() {
   const { group, discussions, notifications, setGroup, setDiscussions, setNotifications, addNotification, markNotificationRead } = useDeckStore();
   const [selected, setSelected] = useState<string | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [draft, setDraft] = useState("");
+  const [ingestStatus, setIngestStatus] = useState<IngestStatus | null>(null);
   const [hidden, setHidden] = useState<ColumnKey[]>(["mentions", "resolved"]);
   const [order] = useState<ColumnKey[]>(["active", "needsResponse", "resolved", "mentions"]);
   const [tab, setTab] = useState<ColumnKey>("active");
@@ -228,9 +252,15 @@ export default function Page() {
       ws.onerror = () => ws?.close();
     }
     connect();
+    async function checkIngest() {
+      try { setIngestStatus(await fetch(`${API}/ingest-status`).then((r) => r.json())); }
+      catch { setIngestStatus({ state: "unreachable", lastMessageAt: null }); }
+    }
+    void checkIngest();
     const pollTimer = window.setInterval(() => {
       if (groupIdRef.current) void loadDiscussions(groupIdRef.current);
     }, 20000);
+    const ingestTimer = window.setInterval(checkIngest, 15000);
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       setExpanded((wasExpanded) => {
@@ -246,6 +276,7 @@ export default function Page() {
       clearTimeout(reconnectTimer);
       clearTimeout(debounceTimer);
       clearInterval(pollTimer);
+      clearInterval(ingestTimer);
       window.removeEventListener("keydown", onKeyDown);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -334,6 +365,7 @@ export default function Page() {
         <div className="hidden size-9 items-center justify-center rounded-full bg-[#7c6cff] text-sm font-bold text-black lg:mb-2 lg:flex">M</div>
         <button title={group.name} className="flex size-11 items-center justify-center rounded-full text-[#e7e9ea] hover:bg-white/[0.08] lg:size-10"><Home className="size-6" /></button>
         <ColumnsMenu order={order} hidden={hidden} onToggle={toggleColumn} />
+        <IngestIndicator status={ingestStatus} />
         <NotificationBell notifications={notifications} onOpen={(id) => id && open(id)} onRead={markRead} />
         <button title="Profile" className="flex size-11 items-center justify-center rounded-full text-[#e7e9ea] hover:bg-white/[0.08] lg:size-10"><User className="size-6" /></button>
       </nav>
