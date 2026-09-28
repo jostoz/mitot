@@ -1,0 +1,111 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum MessageCategory {
+  INCIDENT
+  TASK
+  DECISION
+  KNOWLEDGE
+  GENERAL_CHAT
+  NOISE
+}
+
+enum DiscussionStatus {
+  PROPOSED
+  ACTIVE
+  RESOLVED
+  ARCHIVED
+}
+enum DiscussionVisibility {
+  PRIVATE
+  MEMBERS
+  PUBLIC
+}
+
+
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  fullName     String
+  phoneJid     String?       @unique
+  role         String        @default("member")
+  createdAt    DateTime      @default(now())
+  messagesSent DeckMessage[] @relation("UserSentMessages")
+}
+
+model WhatsAppGroup {
+  id          String             @id
+  name        String
+  isActive    Boolean            @default(true)
+  columns     DeckColumn[]
+  messages    DeckMessage[]
+  discussions DiscussionThread[]
+  createdAt   DateTime           @default(now())
+}
+
+model DeckColumn {
+  id        String          @id @default(uuid())
+  slug      String
+  title     String
+  category  MessageCategory
+  groupId   String
+  group     WhatsAppGroup   @relation(fields: [groupId], references: [id])
+  messages  DeckMessage[]
+  createdAt DateTime        @default(now())
+
+  @@unique([groupId, slug])
+}
+
+model DiscussionThread {
+  id             String           @id @default(uuid())
+  groupId        String
+  group          WhatsAppGroup    @relation(fields: [groupId], references: [id])
+  topicKey       String
+  title          String
+  status         DiscussionStatus @default(ACTIVE)
+  visibility     DiscussionVisibility @default(PRIVATE)
+  tags           Json?
+  summary        String?          @db.Text
+  ownerName      String?
+  nextAction     String?          @db.Text
+  followUpAt     DateTime?
+  priority       String?
+  messages       DeckMessage[]
+  lastActivityAt DateTime
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@unique([groupId, topicKey])
+  @@index([groupId, status, lastActivityAt(sort: Desc)])
+}
+
+model DeckMessage {
+  id              String            @id
+  groupId         String
+  group           WhatsAppGroup     @relation(fields: [groupId], references: [id])
+  columnId        String?
+  column          DeckColumn?       @relation(fields: [columnId], references: [id])
+  senderJid       String
+  senderUserId    String?
+  senderUser      User?             @relation("UserSentMessages", fields: [senderUserId], references: [id])
+  senderName      String
+  content         String            @db.Text
+  category        MessageCategory   @default(GENERAL_CHAT)
+  discussionId    String?
+  discussion      DiscussionThread? @relation(fields: [discussionId], references: [id])
+  parentMessageId String?
+  metadata        Json?
+  isOutbound      Boolean           @default(false)
+  timestamp       DateTime
+  createdAt       DateTime          @default(now())
+
+  @@index([groupId, columnId, createdAt(sort: Desc)])
+  @@index([discussionId, createdAt(sort: Desc)])
+  @@index([parentMessageId])
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@deck/worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@deck/contracts": "workspace:*",
+    "@deck/database": "workspace:*",
+    "@typesafe-ai/sdk": "^0.6.0",
+    "bullmq": "^5.40.0",
+    "ioredis": "^5.5.0",
+    "openai": "^4.85.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.4",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}
