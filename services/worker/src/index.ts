@@ -7,7 +7,7 @@ import OpenAI from "openai";
 import { ClassificationSchema, IngestedMessageSchema, type Classification } from "@deck/contracts";
 import { MessageCategory, prisma } from "@deck/database";
 import { extractUrls, unfurl } from "./unfurl.js";
-import { classifyMessage, aiModelsDiscussion, matchDiscussion, offTopicDiscussion, recentContext, PROMPT_VERSION } from "./discussions.js";
+import { classifyMessage, aiModelsDiscussion, AI_MODELS_TITLE, isModelComparison, matchDiscussion, offTopicDiscussion, recentContext, PROMPT_VERSION, UNRESOLVED_REPLY_KEY, unresolvedReplyDiscussion } from "./discussions.js";
 
 const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379", { maxRetriesPerRequest: null });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -29,9 +29,13 @@ async function discussionFromReply(parentMessageId: string | undefined) {
   if (!parentMessageId) return null;
   const parent = await prisma.deckMessage.findUnique({
     where: { id: parentMessageId },
-    select: { discussion: { select: { id: true, title: true, summary: true } } },
+    select: { discussion: { select: { id: true, title: true, summary: true, lastActivityAt: true } } },
   });
   return parent?.discussion ?? null;
+}
+
+function latestActivityAt(current: Date, incoming: Date) {
+  return current >= incoming ? current : incoming;
 }
 
 
@@ -72,8 +76,12 @@ async function detectMentions(groupId: string, content: string): Promise<string[
 
 new Worker("message-enrichment", async (job) => {
   const input = IngestedMessageSchema.parse(job.data);
+  // `append` puede repetir un mensaje ya entregado al reconectar WhatsApp. No vuelvas a
+  // clasificarlo ni a crear efectos secundarios; DeckMessage es el registro duradero.
+  if (await prisma.deckMessage.findUnique({ where: { id: input.id }, select: { id: true } })) return;
+  const messageAt = new Date(input.timestamp);
   const imagePath = input.media?.kind === "IMAGE" ? path.join(MEDIA_DIR, input.media.fileName) : undefined;
-  const context = await recentContext(input.groupId, new Date(input.timestamp));
+  const context = await recentContext(input.groupId, messageAt);
   const [firstUrl] = extractUrls(input.content);
   const preview = firstUrl ? await unfurl(firstUrl, MEDIA_DIR) : null;
   const contentForModel = preview
@@ -102,19 +110,41 @@ new Worker("message-enrichment", async (job) => {
     .join("\n");
 
   let isNewDiscussion = false;
-  let matchMethod: "citation" | "typesafe" | "noise" = "typesafe";
+  let matchMethod: "citation" | "typesafe" | "noise" | "model_comparison" | "unresolved_reply" = "typesafe";
   let matchConfidence = 1;
   let matchCandidateCount = 0;
   let matchIsNewTopic = false;
   const discussion = category === "NOISE"
-    ? ((matchMethod = "noise"), await offTopicDiscussion(input.groupId, new Date(input.timestamp)))
+    ? ((matchMethod = "noise"), await offTopicDiscussion(input.groupId, messageAt))
     : await withGroupLock(input.groupId, async () => {
         if (parentDiscussion) {
           matchMethod = "citation";
           const refreshed = await refreshSummary(parentDiscussion.title, parentDiscussion.summary, describedMessage, imagePath);
           return prisma.discussionThread.update({
             where: { id: parentDiscussion.id },
-            data: { lastActivityAt: new Date(input.timestamp), title: refreshed.title ?? parentDiscussion.title, summary: refreshed.summary ?? parentDiscussion.summary },
+            data: { lastActivityAt: latestActivityAt(parentDiscussion.lastActivityAt, messageAt), title: refreshed.title ?? parentDiscussion.title, summary: refreshed.summary ?? parentDiscussion.summary },
+          });
+        }
+        if (input.parentMessageId) {
+          // El historial puede traer una respuesta sin su padre. Forzar un match semántico
+          // aquí inventa una relación; se conserva aparte y se adopta al llegar el padre.
+          matchMethod = "unresolved_reply";
+          matchConfidence = 1;
+          const unresolved = await unresolvedReplyDiscussion(input.groupId, messageAt);
+          return prisma.discussionThread.update({
+            where: { id: unresolved.id },
+            data: { lastActivityAt: latestActivityAt(unresolved.lastActivityAt, messageAt) },
+          });
+        }
+        if (isModelComparison(input.content)) {
+          matchMethod = "model_comparison";
+          matchConfidence = 1;
+          matchCandidateCount = 1;
+          const models = await aiModelsDiscussion(input.groupId);
+          const refreshed = await refreshSummary(models.title, models.summary, describedMessage, imagePath);
+          return prisma.discussionThread.update({
+            where: { id: models.id },
+            data: { lastActivityAt: latestActivityAt(models.lastActivityAt, messageAt), title: AI_MODELS_TITLE, summary: refreshed.summary ?? models.summary },
           });
         }
         const result = await matchDiscussion(input.groupId, describedMessage, context);
@@ -125,14 +155,14 @@ new Worker("message-enrichment", async (job) => {
           const refreshed = await refreshSummary(result.thread.title, result.thread.summary, describedMessage, imagePath);
           return prisma.discussionThread.update({
             where: { id: result.thread.id },
-            data: { lastActivityAt: new Date(input.timestamp), title: refreshed.title ?? result.thread.title, summary: refreshed.summary ?? result.thread.summary },
+            data: { lastActivityAt: latestActivityAt(result.thread.lastActivityAt, messageAt), title: refreshed.title ?? result.thread.title, summary: refreshed.summary ?? result.thread.summary },
           });
         }
         isNewDiscussion = true;
         return prisma.discussionThread.create({
           data: {
             groupId: input.groupId, topicKey: randomUUID(), title: classification.topic, summary: classification.summary,
-            tags: [category], lastActivityAt: new Date(input.timestamp),
+            tags: [category], lastActivityAt: messageAt,
           },
         });
       });
@@ -156,6 +186,23 @@ new Worker("message-enrichment", async (job) => {
       create: { messageId: saved.id, kind: input.media.kind, mimeType: input.media.mimeType, fileName: input.media.fileName, sizeBytes: input.media.sizeBytes },
       update: {},
     });
+  }
+
+  // Si el padre llegó después, mueve sus respuestas recuperadas desde el bucket temporal
+  // al hilo real antes de publicar el evento que hará al cliente recargar el snapshot.
+  if (discussion && discussion.topicKey !== UNRESOLVED_REPLY_KEY) {
+    const unresolvedReplies = await prisma.deckMessage.findMany({
+      where: { parentMessageId: saved.id, discussion: { topicKey: UNRESOLVED_REPLY_KEY } },
+      select: { id: true, timestamp: true },
+    });
+    if (unresolvedReplies.length) {
+      await prisma.deckMessage.updateMany({
+        where: { id: { in: unresolvedReplies.map((reply) => reply.id) } },
+        data: { discussionId: discussion.id },
+      });
+      const latestReplyAt = unresolvedReplies.reduce((latest, reply) => latestActivityAt(latest, reply.timestamp), discussion.lastActivityAt);
+      await prisma.discussionThread.update({ where: { id: discussion.id }, data: { lastActivityAt: latestReplyAt } });
+    }
   }
   await prisma.matchDecision.upsert({
     where: { messageId: saved.id },

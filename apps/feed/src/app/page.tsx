@@ -5,6 +5,7 @@ import { Sidebar } from "@/components/sidebar";
 import { Deck } from "@/components/deck";
 import { api } from "@/lib/api";
 import { startLiveSync } from "@/lib/live";
+import { playNotificationSound, unlockNotificationSound } from "@/lib/notification-sound";
 import { useDeckStore } from "@/lib/store";
 
 export default function Home() {
@@ -14,7 +15,10 @@ export default function Home() {
   const setGroups = useDeckStore((state) => state.setGroups);
   const setDiscussions = useDeckStore((state) => state.setDiscussions);
   const setNotifications = useDeckStore((state) => state.setNotifications);
+  const notificationPopouts = useDeckStore((state) => state.notificationPopouts);
+  const dismissNotificationPopout = useDeckStore((state) => state.dismissNotificationPopout);
   const groupIdRef = useRef<string | null>(null);
+  const soundedPopoutIds = useRef(new Set<string>());
 
   useEffect(() => {
     void (async () => {
@@ -37,6 +41,31 @@ export default function Home() {
     })();
   }, [group, setDiscussions, setNotifications]);
 
+  useEffect(() => {
+    const timers = notificationPopouts.map((notification) =>
+      window.setTimeout(() => dismissNotificationPopout(notification.id), 8000),
+    );
+    return () => timers.forEach(window.clearTimeout);
+  }, [dismissNotificationPopout, notificationPopouts]);
+
+  useEffect(() => {
+    const unlock = () => void unlockNotificationSound();
+    document.addEventListener("pointerdown", unlock, { once: true });
+    document.addEventListener("keydown", unlock, { once: true });
+    return () => {
+      document.removeEventListener("pointerdown", unlock);
+      document.removeEventListener("keydown", unlock);
+    };
+  }, []);
+
+  useEffect(() => {
+    for (const notification of notificationPopouts) {
+      if (soundedPopoutIds.current.has(notification.id)) continue;
+      soundedPopoutIds.current.add(notification.id);
+      void playNotificationSound();
+    }
+  }, [notificationPopouts]);
+
   return (
     <div className="flex h-dvh overflow-hidden bg-bg">
       <Sidebar />
@@ -49,6 +78,28 @@ export default function Home() {
           </p>
         )}
       </main>
+
+      <div aria-live="polite" aria-label="Notificaciones nuevas" className="pointer-events-none fixed bottom-4 right-4 z-50 flex w-[min(360px,calc(100vw-2rem))] flex-col gap-2">
+        {notificationPopouts.map((notification) => (
+          <article key={notification.id} className="pointer-events-auto rounded-[14px] border border-line bg-elevated px-4 py-3 shadow-[0_16px_42px_rgba(0,0,0,0.6)]">
+            <div className="flex items-start gap-3">
+              <div className="min-w-0 flex-1">
+                <p className="text-[12px] font-semibold uppercase tracking-wide text-accent">{notification.type.replaceAll("_", " ")}</p>
+                <p className="mt-0.5 text-[14px] font-semibold text-fg">{notification.title}</p>
+                {notification.body ? <p className="mt-1 line-clamp-2 text-[13px] leading-[18px] text-fg-2">{notification.body}</p> : null}
+              </div>
+              <button
+                type="button"
+                aria-label={`Cerrar notificación: ${notification.title}`}
+                onClick={() => dismissNotificationPopout(notification.id)}
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-full text-fg-3 transition-colors hover:bg-white/8 hover:text-fg"
+              >
+                ×
+              </button>
+            </div>
+          </article>
+        ))}
+      </div>
     </div>
   );
 }

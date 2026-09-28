@@ -10,7 +10,7 @@ import { choice, TypeSafeClient } from "@typesafe-ai/sdk";
  * permite comparar la tasa de corrección manual (RoutingCorrection) entre versiones sin
  * tener que adivinar si un cambio de prompt ayudó o empeoró las cosas.
  */
-export const PROMPT_VERSION = "2026-09-28-two-pass-image-description";
+export const PROMPT_VERSION = "2026-09-28-model-comparison-routing";
 export const CLASSIFY_SYSTEM_PROMPT =
   "Classify a message from a WhatsApp group whose sole purpose is AI-assisted programming and technology topics (coding, tools, infra, models, dev workflows). If an image is attached, look at it and use its actual visual content (code, error, UI, diagram, chart, screenshot, etc.) to inform the classification, title, topic and summary — describe what the image actually shows, not just that an image was sent. Return JSON with category (INCIDENT|TASK|DECISION|KNOWLEDGE|GENERAL_CHAT|NOISE), title, topic, summary, links, assignedTo, isTask. topic is a concise stable theme used to group a conversation; use the same topic for related messages. A question, recommendation, comparison, or conversation seeking an answer is GENERAL_CHAT, not KNOWLEDGE. KNOWLEDGE is only a reusable factual answer, guide, or reference. NOISE means no substance at all, regardless of length: bare acknowledgements/thanks ('ok', 'vale', 'gracias', 'dale'), greetings, emoji-only reactions, or messages fully unrelated to programming/AI/technology. Banter, jokes, memes and pure amusement are NOISE even when they quote or link something technical: if the message adds no claim, question, fact or opinion of its own and exists only to laugh or react (laughter strings like 'jajaja', 'lol', mockery, crude jokes, 'look at this lol'), classify it NOISE regardless of what the linked page says — judge the sender's own words, not the link's content. A short message is NOT automatically NOISE if it reports a concrete technical fact, result, tool, model, cost, or experiment (e.g. 'Model X did Y in Z minutes for $W') — that is GENERAL_CHAT or KNOWLEDGE. An opinion, critique, agreement, or disagreement about a technical/AI topic already being discussed in the recent context (e.g. commenting on bias in a shown ranking, disputing a claim, adding a counterpoint) is GENERAL_CHAT, not NOISE, even without hard data — it is a real contribution to the conversation. An image attachment is never NOISE by itself. When an image is attached, the summary MUST name the concrete entities visible in it verbatim: product/model/tool/brand names, version numbers, tiers or positions in a ranking (and which item sits where), error text, metrics and figures. Write what a reader who cannot see the image would need to react to it, including anything surprising or contentious about the arrangement. Do not invent facts.";
 
@@ -81,6 +81,27 @@ export async function offTopicDiscussion(groupId: string, lastActivityAt: Date =
   });
 }
 
+export const UNRESOLVED_REPLY_KEY = "unresolved-replies";
+export const UNRESOLVED_REPLY_TITLE = "↪️ Respuestas sin contexto";
+
+/** Bucket temporal para respuestas cuyo mensaje citado no llegó en el historial recuperado. */
+export async function unresolvedReplyDiscussion(groupId: string, lastActivityAt: Date) {
+  return prisma.discussionThread.upsert({
+    where: { groupId_topicKey: { groupId, topicKey: UNRESOLVED_REPLY_KEY } },
+    create: {
+      groupId,
+      topicKey: UNRESOLVED_REPLY_KEY,
+      title: UNRESOLVED_REPLY_TITLE,
+      summary: "Respuestas recuperadas cuyo mensaje citado todavía no está disponible.",
+      tags: ["GENERAL_CHAT"],
+      status: "PROPOSED",
+      visibility: "PRIVATE",
+      lastActivityAt,
+    },
+    update: { lastActivityAt },
+  });
+}
+
 export const AI_MODELS_KEY = "ai-models";
 export const AI_MODELS_TITLE = "🤖 Modelos de IA";
 
@@ -109,6 +130,20 @@ export async function aiModelsDiscussion(groupId: string) {
   });
 }
 
+const MODEL_ENTITY_PATTERN = /\b(?:claude|opus|sonnet|haiku|chatgpt|gpt(?:[-\s]?\d[\w.-]*)?|gemini|llama|qwen|deepseek|mistral|grok|o[1-4]|codex|phi|kimi|sol)\b/giu;
+const MODEL_COMPARISON_PATTERN = /\b(?:vs\.?|versus|compet\p{L}*|compit\p{L}*|compar\p{L}*|mejor|peor|ranking|benchmark|state.of.the.art|lanzamiento|release|versión|modelo)\b/iu;
+
+/**
+ * Intención especializada: una comparación, ranking o posicionamiento entre modelos no es
+ * conversación sobre la API de un producto. “Sol compite con Opus, no con Sonnet” es el
+ * caso límite: Sol por sí solo es ambiguo, pero acompañado de otros nombres de modelo no.
+ */
+export function isModelComparison(content: string) {
+  const entities = new Set([...content.toLowerCase().matchAll(MODEL_ENTITY_PATTERN)].map((match) => match[0]));
+  const hasUnambiguousEntity = [...entities].some((entity) => entity !== "sol");
+  return MODEL_COMPARISON_PATTERN.test(content) && (entities.size >= 2 || hasUnambiguousEntity);
+}
+
 const typesafe = new TypeSafeClient();
 const MATCH_CONFIDENCE_THRESHOLD = Number(process.env.DISCUSSION_MATCH_THRESHOLD ?? 0.6);
 const CANDIDATE_LIMIT = 12;
@@ -121,24 +156,23 @@ export async function matchDiscussion(
   content: string,
   context: string,
   excludeId?: string | null,
-): Promise<{ thread: { id: string; title: string; summary: string | null } | null; confidence: number; candidateCount: number }> {
+): Promise<{ thread: { id: string; title: string; summary: string | null; lastActivityAt: Date } | null; confidence: number; candidateCount: number }> {
   const recent = await prisma.discussionThread.findMany({
     where: {
       groupId,
       status: { in: ["ACTIVE", "PROPOSED"] },
-      topicKey: { notIn: [OFF_TOPIC_KEY, AI_MODELS_KEY] },
+      topicKey: { notIn: [OFF_TOPIC_KEY, AI_MODELS_KEY, UNRESOLVED_REPLY_KEY] },
       ...(excludeId ? { id: { not: excludeId } } : {}),
     },
     orderBy: { lastActivityAt: "desc" },
-    take: CANDIDATE_LIMIT,
-    select: { id: true, title: true, summary: true },
+    select: { id: true, title: true, summary: true, lastActivityAt: true },
   });
   // El hilo constante de modelos de IA siempre es candidato, sin importar cuándo tuvo
   // actividad por última vez: si no lo forzamos, un hilo poco usado se cae del top-N
   // ordenado por lastActivityAt en cuanto hay actividad reciente en otros temas.
   const constant = await prisma.discussionThread.findFirst({
     where: { groupId, topicKey: AI_MODELS_KEY, ...(excludeId ? { id: { not: excludeId } } : {}) },
-    select: { id: true, title: true, summary: true },
+    select: { id: true, title: true, summary: true, lastActivityAt: true },
   });
   const candidates = constant && !recent.some((c) => c.id === constant.id) ? [...recent, constant] : recent;
   if (!candidates.length) return { thread: null, confidence: 1, candidateCount: 0 };

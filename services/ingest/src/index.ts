@@ -13,6 +13,8 @@ const enrichmentQueue = new Queue("message-enrichment", { connection: redis });
 const outboundQueue = new Queue("whatsapp-outbound", { connection: redis });
 const TARGET_GROUPS = new Set((process.env.WHATSAPP_GROUP_IDS ?? "").split(",").map((value) => value.trim()).filter(Boolean));
 const DEBOUNCE_MS = Number(process.env.DEBOUNCE_MS ?? 1500);
+const recoveryHours = Number(process.env.WHATSAPP_RECOVERY_HOURS ?? 0);
+const RECOVERY_SINCE = Number.isFinite(recoveryHours) && recoveryHours > 0 ? Date.now() - recoveryHours * 60 * 60 * 1000 : null;
 let pairingQrSvg = "";
 const GROUP_NAMES = new Map<string, string>();
 const MEDIA_DIR = process.env.MEDIA_STORAGE_DIR ?? path.resolve(process.cwd(), "..", "..", "media-storage");
@@ -78,6 +80,37 @@ async function saveMedia(message: WAMessage, detected: { field: string; kind: Me
   }
 }
 
+type IngestSource = "notify" | "append" | "history";
+
+async function enqueueMessage(message: WAMessage, source: IngestSource) {
+  try {
+    const groupId = message.key.remoteJid;
+    const timestamp = Number(message.messageTimestamp) * 1000;
+    const isTargetGroup = Boolean(groupId?.endsWith("@g.us") && (TARGET_GROUPS.size === 0 || TARGET_GROUPS.has(groupId)));
+    if (!isTargetGroup || !groupId || !message.message || !message.key.id) return;
+    // El full-history sync solo se habilita para recuperación manual y acotada.
+    if (source === "history" && (!RECOVERY_SINCE || !Number.isFinite(timestamp) || timestamp < RECOVERY_SINCE)) return;
+
+    if (source !== "history") health.lastMessageAt = new Date().toISOString();
+    const content = unwrapContent(message.message as Record<string, unknown>);
+    const text = captionText(content);
+    const detected = detectMedia(content);
+    const media = detected ? await saveMedia(message, detected, message.key.id) : undefined;
+    console.log(`WhatsApp ${source} message: group=${groupId} text=${Boolean(text)} media=${media?.kind ?? "none"} accepted=${Boolean(text || media)}.`);
+    if (!text && !media) return;
+
+    const payload = IngestedMessageSchema.parse({
+      id: message.key.id, groupId, groupName: GROUP_NAMES.get(groupId) ?? groupId, senderJid: message.key.participant || groupId,
+      senderName: message.pushName || message.key.participant || "Unknown", content: text || MEDIA_PLACEHOLDER[media!.kind],
+      parentMessageId: message.message?.extendedTextMessage?.contextInfo?.stanzaId,
+      timestamp: new Date(timestamp).toISOString(), isOutbound: Boolean(message.key.fromMe), media,
+    });
+    await enrichmentQueue.add("enrich", payload, { jobId: payload.id, delay: DEBOUNCE_MS, removeOnComplete: 1000, removeOnFail: 5000 });
+  } catch (error) {
+    console.error(`Failed to process ${source} WhatsApp message, skipping it:`, error);
+  }
+}
+
 const AUTH_DIR = process.env.WHATSAPP_AUTH_DIR ?? ".wa-auth";
 const AUTH_BACKUP_DIR = process.env.WHATSAPP_AUTH_BACKUP_DIR ?? `${AUTH_DIR}.backup`;
 let starting = false;
@@ -112,7 +145,7 @@ async function startSocket() {
   const { version } = await fetchLatestBaileysVersion();
   let groupMetadataCache = new Map<string, GroupMetadata>();
   const socket = makeWASocket({
-    auth: state, version, logger: P({ level: "silent" }), printQRInTerminal: false, syncFullHistory: false,
+    auth: state, version, logger: P({ level: "silent" }), printQRInTerminal: false, syncFullHistory: RECOVERY_SINCE !== null,
     cachedGroupMetadata: async (jid) => groupMetadataCache.get(jid),
   });
 
@@ -145,33 +178,15 @@ async function startSocket() {
   });
   socket.ev.on("messages.upsert", ({ messages, type }) => {
     console.log(`[${new Date().toISOString()}] WhatsApp messages.upsert: type=${type}, count=${messages.length}.`);
-    for (const message of messages) {
-      void (async () => {
-        try {
-          const groupId = message.key.remoteJid;
-          const shouldProcess = type === "notify" || Boolean(message.key.fromMe);
-          const isTargetGroup = Boolean(groupId?.endsWith("@g.us") && (TARGET_GROUPS.size === 0 || TARGET_GROUPS.has(groupId)));
-          if (!shouldProcess || !isTargetGroup || !groupId || !message.message || !message.key.id) return;
-          health.lastMessageAt = new Date().toISOString();
-          const content = unwrapContent(message.message as Record<string, unknown>);
-          const text = captionText(content);
-          const detected = detectMedia(content);
-          const media = detected ? await saveMedia(message, detected, message.key.id) : undefined;
-          console.log(`WhatsApp message: group=${groupId} text=${Boolean(text)} media=${media?.kind ?? "none"} accepted=${Boolean(text || media)}.`);
-          if (!text && !media) return;
-          const payload = IngestedMessageSchema.parse({
-            id: message.key.id, groupId, groupName: GROUP_NAMES.get(groupId) ?? groupId, senderJid: message.key.participant ?? groupId,
-            senderName: message.pushName ?? "Unknown", content: text || MEDIA_PLACEHOLDER[media!.kind],
-            parentMessageId: (message.message?.extendedTextMessage?.contextInfo?.stanzaId),
-            timestamp: new Date(Number(message.messageTimestamp) * 1000).toISOString(), isOutbound: Boolean(message.key.fromMe),
-            media,
-          });
-          void enrichmentQueue.add("enrich", payload, { jobId: payload.id, delay: DEBOUNCE_MS, removeOnComplete: 1000, removeOnFail: 5000 });
-        } catch (error) {
-          console.error("Failed to process incoming WhatsApp message, skipping it:", error);
-        }
-      })();
-    }
+    // `append` son los mensajes que WhatsApp reentrega tras una indisponibilidad del
+    // companion. Se encolan igual que los mensajes en tiempo real.
+    for (const message of messages) void enqueueMessage(message, type);
+  });
+  socket.ev.on("messaging-history.set", ({ messages, syncType }) => {
+    if (!RECOVERY_SINCE) return;
+    const recoverable = messages.filter((message) => Number(message.messageTimestamp) * 1000 >= RECOVERY_SINCE);
+    console.log(`[${new Date().toISOString()}] WhatsApp history sync type=${syncType ?? "unknown"}: ${recoverable.length}/${messages.length} mensajes en ventana de recuperación.`);
+    for (const message of recoverable) void enqueueMessage(message, "history");
   });
 
 

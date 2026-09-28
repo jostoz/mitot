@@ -6,10 +6,10 @@ import { DiscussionCard } from "@/components/discussion-card";
 import { Avatar, LinkPreviewCard, MediaPreview, RichText } from "@/components/primitives";
 import { BackIcon, MoreIcon, PinIcon, SearchIcon, ShareIcon } from "@/components/icons";
 import { api, relTime, type DeckMessage, type Discussion, type ObservabilityVersion } from "@/lib/api";
+import { isVisibleDiscussion, OFF_TOPIC_KEY } from "@/lib/discussions";
 import { useDeckStore } from "@/lib/store";
 
-/** Debe coincidir con OFF_TOPIC_TITLE del worker: el bucket de ruido no es publicable. */
-const OFF_TOPIC_TITLE = "🎲 Sin tema";
+/** El bucket de ruido se conserva para trazabilidad, pero nunca se publica. */
 
 export type ColumnKind = "active" | "needsResponse" | "resolved" | "pinned" | "notifications" | "search" | "detail" | "stats";
 
@@ -26,8 +26,9 @@ export const columnCatalog: { kind: ColumnKind; label: string; hint: string }[] 
 function useDiscussionsByKind(kind: ColumnKind) {
   const discussions = useDeckStore((state) => state.discussions);
   return useMemo(() => {
-    if (kind === "resolved") return discussions.filter((item) => item.status === "RESOLVED");
-    const active = discussions.filter((item) => item.status === "ACTIVE" || item.status === "PROPOSED");
+    const visible = discussions.filter(isVisibleDiscussion);
+    if (kind === "resolved") return visible.filter((item) => item.status === "RESOLVED");
+    const active = visible.filter((item) => item.status === "ACTIVE" || item.status === "PROPOSED");
     if (kind === "needsResponse") {
       return active.filter((item) => /\?$/.test(item.messages.at(-1)?.content.trim() ?? ""));
     }
@@ -64,7 +65,7 @@ export function DiscussionListColumn({ kind, controls, selectedId, onOpen }: Lis
 }
 
 export function SearchColumn({ controls, selectedId, onOpen }: ListProps) {
-  const discussions = useDeckStore((state) => state.discussions);
+  const discussions = useDeckStore((state) => state.discussions).filter(isVisibleDiscussion);
   const [query, setQuery] = useState("");
   const normalized = query.trim().toLowerCase();
   const results = normalized
@@ -160,6 +161,8 @@ const CATEGORY_LABELS: Record<string, string> = {
 const METHOD_LABELS: Record<string, string> = {
   citation: "Cita a otro mensaje (determinista)",
   typesafe: "Matcher probabilístico",
+  model_comparison: "Comparativa de modelos (determinista)",
+  unresolved_reply: "Respuesta sin contexto (en espera)",
   noise: "Descartado como ruido",
 };
 
@@ -404,7 +407,7 @@ function PublishControl({ discussion }: { discussion: Discussion }) {
   const isPublic = discussion.visibility === "PUBLIC";
   const publicUrl = `/community/${encodeURIComponent(discussion.groupId)}`;
   // El servidor rechaza publicar el bucket de ruido: no ofrezcas la acción.
-  const publishable = discussion.title !== OFF_TOPIC_TITLE;
+  const publishable = discussion.topicKey !== OFF_TOPIC_KEY;
 
   const toggle = async () => {
     const next = isPublic ? "PRIVATE" : "PUBLIC";

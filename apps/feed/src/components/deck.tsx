@@ -12,6 +12,7 @@ import {
   type ColumnKind,
 } from "@/components/columns";
 import { PlusIcon } from "@/components/icons";
+import { isVisibleDiscussion } from "@/lib/discussions";
 import { useDeckStore } from "@/lib/store";
 
 /**
@@ -22,7 +23,7 @@ import { useDeckStore } from "@/lib/store";
 type DeckColumnState = { id: string; kind: ColumnKind; discussionId?: string };
 
 export function Deck() {
-  const discussions = useDeckStore((state) => state.discussions);
+  const discussions = useDeckStore((state) => state.discussions).filter(isVisibleDiscussion);
   const [columns, setColumns] = useState<DeckColumnState[]>([
     { id: "c1", kind: "active" },
     { id: "c2", kind: "needsResponse" },

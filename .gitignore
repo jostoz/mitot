@@ -12,6 +12,7 @@ dist/
 **/.wa-auth/
 .wa-auth.backup/
 **/.wa-auth.backup/
+**/.wa-auth.*/
 
 media-storage/
 **/media-storage/

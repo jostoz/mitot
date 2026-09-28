@@ -185,7 +185,7 @@ model MatchDecision {
   message         DeckMessage       @relation(fields: [messageId], references: [id])
   promptVersion   String
   /// "citation" (determinista, cita a un mensaje con hilo) | "typesafe" (matcher
-  /// probabilístico) | "noise" (fue a Sin tema)
+  /// probabilístico) | "model_comparison" (comparativa de modelos) | "unresolved_reply" (cita sin padre) | "noise" (fue a Sin tema)
   method          String
   category        MessageCategory
   matchedThreadId String?

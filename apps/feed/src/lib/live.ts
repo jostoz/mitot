@@ -1,7 +1,11 @@
 import { api, type Notification } from "@/lib/api";
 import { useDeckStore } from "@/lib/store";
 
-/** Abre el WebSocket /events con reconexión exponencial, polling de respaldo y recarga con debounce. */
+/**
+ * Mantiene el cliente consistente con el servidor aunque se pierdan eventos: al reconectar
+ * el WebSocket, recuperar WhatsApp, volver a la pestaña o cada 20 s se trae el snapshot
+ * completo de discusiones y notificaciones del grupo activo.
+ */
 export function startLiveSync(getGroupId: () => string | null) {
   const store = useDeckStore.getState;
   let socket: WebSocket | undefined;
@@ -9,11 +13,34 @@ export function startLiveSync(getGroupId: () => string | null) {
   let debounceTimer: number | undefined;
   let attempt = 0;
   let stopped = false;
+  let connectedOnce = false;
+  let previousIngestState: string | undefined;
+  let syncInFlight: Promise<void> | undefined;
 
-  const reloadDiscussions = async () => {
+  const synchronize = () => {
+    if (syncInFlight) return syncInFlight;
     const groupId = getGroupId();
-    if (!groupId) return;
-    store().setDiscussions(await api.discussions(groupId));
+    if (!groupId) return Promise.resolve();
+
+    syncInFlight = Promise.all([api.discussions(groupId), api.notifications(groupId)])
+      .then(([discussions, notifications]) => {
+        // El usuario pudo cambiar de grupo mientras la petición estaba en vuelo.
+        if (getGroupId() !== groupId) return;
+        store().setDiscussions(discussions);
+        store().setNotifications(notifications);
+      })
+      .catch((error) => {
+        console.error("Failed to synchronize deck state:", error);
+      })
+      .finally(() => {
+        syncInFlight = undefined;
+      });
+    return syncInFlight;
+  };
+
+  const scheduleSynchronize = () => {
+    window.clearTimeout(debounceTimer);
+    debounceTimer = window.setTimeout(() => void synchronize(), 500);
   };
 
   const connect = () => {
@@ -21,14 +48,21 @@ export function startLiveSync(getGroupId: () => string | null) {
     url.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     socket = new WebSocket(url);
     socket.onopen = () => {
+      const recovered = connectedOnce;
+      connectedOnce = true;
       attempt = 0;
+      // Los eventos que llegaron mientras el socket estaba caído no se pueden reconstruir
+      // individualmente; el snapshot es la fuente de verdad.
+      if (recovered) void synchronize();
     };
     socket.onmessage = (event) => {
-      if (!getGroupId()) return;
+      const groupId = getGroupId();
+      if (!groupId) return;
       const parsed = JSON.parse(event.data) as { type: string; notification?: Notification };
-      if (parsed.type === "notification.created" && parsed.notification) store().addNotification(parsed.notification);
-      window.clearTimeout(debounceTimer);
-      debounceTimer = window.setTimeout(() => void reloadDiscussions(), 500);
+      if (parsed.type === "notification.created" && parsed.notification?.groupId === groupId) {
+        store().addNotification(parsed.notification);
+      }
+      scheduleSynchronize();
     };
     socket.onclose = () => {
       if (stopped) return;
@@ -40,16 +74,28 @@ export function startLiveSync(getGroupId: () => string | null) {
 
   const checkIngest = async () => {
     try {
-      store().setIngestStatus(await api.ingestStatus());
+      const status = await api.ingestStatus();
+      const recovered = status.state === "open" && previousIngestState !== undefined && previousIngestState !== "open";
+      previousIngestState = status.state;
+      store().setIngestStatus(status);
+      // Tras una desconexión de WhatsApp pueden haberse encolado o perdido eventos en el
+      // cliente. Al volver a abrir, reconciliamos con Postgres.
+      if (recovered) void synchronize();
     } catch {
+      previousIngestState = "unreachable";
       store().setIngestStatus({ state: "unreachable", lastMessageAt: null });
     }
   };
 
+  const onVisibilityChange = () => {
+    if (document.visibilityState === "visible") void synchronize();
+  };
+
   connect();
   void checkIngest();
-  const pollTimer = window.setInterval(() => void reloadDiscussions(), 20000);
+  const pollTimer = window.setInterval(() => void synchronize(), 20000);
   const ingestTimer = window.setInterval(() => void checkIngest(), 15000);
+  document.addEventListener("visibilitychange", onVisibilityChange);
 
   return () => {
     stopped = true;
@@ -58,5 +104,6 @@ export function startLiveSync(getGroupId: () => string | null) {
     window.clearTimeout(debounceTimer);
     window.clearInterval(pollTimer);
     window.clearInterval(ingestTimer);
+    document.removeEventListener("visibilitychange", onVisibilityChange);
   };
 }

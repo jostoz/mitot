@@ -6,6 +6,7 @@ type State = {
   groups: Group[];
   discussions: Discussion[];
   notifications: Notification[];
+  notificationPopouts: Notification[];
   ingestStatus: IngestStatus | null;
   loaded: boolean;
   setGroups(groups: Group[]): void;
@@ -13,6 +14,7 @@ type State = {
   setDiscussions(discussions: Discussion[]): void;
   setNotifications(notifications: Notification[]): void;
   addNotification(notification: Notification): void;
+  dismissNotificationPopout(id: string): void;
   markNotificationRead(id: string): void;
   setIngestStatus(status: IngestStatus): void;
   patchDiscussion(id: string, data: Partial<Discussion>): void;
@@ -24,6 +26,7 @@ export const useDeckStore = create<State>((set) => ({
   groups: [],
   discussions: [],
   notifications: [],
+  notificationPopouts: [],
   ingestStatus: null,
   loaded: false,
   setGroups: (groups) => set({ groups }),
@@ -37,11 +40,15 @@ export const useDeckStore = create<State>((set) => ({
     }),
   setNotifications: (notifications) => set({ notifications }),
   addNotification: (notification) =>
-    set((state) =>
-      state.notifications.some((item) => item.id === notification.id)
-        ? state
-        : { notifications: [notification, ...state.notifications] },
-    ),
+    set((state) => {
+      if (state.notifications.some((item) => item.id === notification.id)) return state;
+      return {
+        notifications: [notification, ...state.notifications],
+        notificationPopouts: [notification, ...state.notificationPopouts].slice(0, 3),
+      };
+    }),
+  dismissNotificationPopout: (id) =>
+    set((state) => ({ notificationPopouts: state.notificationPopouts.filter((item) => item.id !== id) })),
   markNotificationRead: (id) =>
     set((state) => ({
       notifications: state.notifications.map((item) => (item.id === id ? { ...item, read: true } : item)),

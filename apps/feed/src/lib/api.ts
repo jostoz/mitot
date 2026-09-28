@@ -28,9 +28,10 @@ export type DeckMessage = {
 export type Discussion = {
   id: string;
   groupId: string;
+  topicKey: string;
   title: string;
   summary: string | null;
-  status: string;
+  status: "PROPOSED" | "ACTIVE" | "RESOLVED";
   visibility: "PRIVATE" | "MEMBERS" | "PUBLIC";
   ownerName: string | null;
   nextAction: string | null;
