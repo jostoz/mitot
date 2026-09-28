@@ -18,7 +18,14 @@ const GROUP_NAMES = new Map<string, string>();
 const MEDIA_DIR = process.env.MEDIA_STORAGE_DIR ?? path.resolve(process.cwd(), "..", "..", "media-storage");
 const MEDIA_KIND_BY_FIELD: Record<string, MediaKind> = { imageMessage: "IMAGE", videoMessage: "VIDEO", audioMessage: "AUDIO", documentMessage: "DOCUMENT", stickerMessage: "STICKER" };
 const MEDIA_PLACEHOLDER: Record<MediaKind, string> = { IMAGE: "[Imagen]", VIDEO: "[Video]", AUDIO: "[Nota de voz]", DOCUMENT: "[Documento]", STICKER: "[Sticker]" };
+type ConnectionState = "connecting" | "open" | "closed";
+const health = { state: "connecting" as ConnectionState, connectedAt: null as string | null, lastMessageAt: null as string | null, lastCloseReason: null as string | null, reconnects: 0 };
 createServer((request, response) => {
+  if (request.url === "/status") {
+    response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+    response.end(JSON.stringify(health));
+    return;
+  }
   if (request.url === "/qr.svg") {
     response.writeHead(pairingQrSvg ? 200 : 204, { "cache-control": "no-store", "content-type": "image/svg+xml" });
     response.end(pairingQrSvg);
@@ -83,12 +90,15 @@ async function start() {
   socket.ev.on("creds.update", saveCreds);
   socket.ev.on("connection.update", ({ connection, lastDisconnect, qr: pairingQr }) => {
     if (connection === "open") {
+      health.state = "open";
+      health.connectedAt = new Date().toISOString();
+      health.lastCloseReason = null;
       void socket.groupFetchAllParticipating().then((groupById) => {
         groupMetadataCache = new Map(Object.entries(groupById));
         const groups = Object.values(groupById).map((group) => ({ id: group.id, name: group.subject }));
         for (const group of groups) GROUP_NAMES.set(group.id, group.name);
         const selectedGroups = TARGET_GROUPS.size > 0 ? groups.filter((group) => TARGET_GROUPS.has(group.id)) : groups;
-        console.log(`WhatsApp connected. Ingestion target: ${TARGET_GROUPS.size > 0 ? "configured groups" : "all groups"}.`);
+        console.log(`[${new Date().toISOString()}] WhatsApp connected. Ingestion target: ${TARGET_GROUPS.size > 0 ? "configured groups" : "all groups"}.`);
         console.table(selectedGroups);
       });
     }
@@ -97,12 +107,15 @@ async function start() {
     }
     if (connection === "close") {
       const statusCode = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
-      console.error(`WhatsApp connection closed${statusCode ? ` (status ${statusCode})` : ""}.`);
+      health.state = "closed";
+      health.reconnects += 1;
+      health.lastCloseReason = `status ${statusCode ?? "unknown"} at ${new Date().toISOString()}`;
+      console.error(`[${new Date().toISOString()}] WhatsApp connection closed${statusCode ? ` (status ${statusCode})` : ""}.`);
       if (statusCode !== DisconnectReason.loggedOut) void start();
     }
   });
   socket.ev.on("messages.upsert", ({ messages, type }) => {
-    console.log(`WhatsApp messages.upsert: type=${type}, count=${messages.length}.`);
+    console.log(`[${new Date().toISOString()}] WhatsApp messages.upsert: type=${type}, count=${messages.length}.`);
     for (const message of messages) {
       void (async () => {
         try {
@@ -110,6 +123,7 @@ async function start() {
           const shouldProcess = type === "notify" || Boolean(message.key.fromMe);
           const isTargetGroup = Boolean(groupId?.endsWith("@g.us") && (TARGET_GROUPS.size === 0 || TARGET_GROUPS.has(groupId)));
           if (!shouldProcess || !isTargetGroup || !groupId || !message.message || !message.key.id) return;
+          health.lastMessageAt = new Date().toISOString();
           const content = unwrapContent(message.message as Record<string, unknown>);
           const text = captionText(content);
           const detected = detectMedia(content);
