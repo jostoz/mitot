@@ -6,14 +6,3 @@
 body { @apply m-0 bg-slate-950 text-slate-100; }
 * { box-sizing: border-box; }
 
-body > main {
-  padding: 0 !important;
-}
-
-body > main > div {
-  max-width: none !important;
-  height: 100vh !important;
-  margin: 0 !important;
-  border-radius: 0 !important;
-  box-shadow: none !important;
-}

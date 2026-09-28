@@ -26,10 +26,21 @@ function withGroupLock<T>(groupId: string, fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
-const CLASSIFY_SYSTEM_PROMPT = "Classify a message from a WhatsApp group whose sole purpose is AI-assisted programming and technology topics (coding, tools, infra, models, dev workflows). If an image is attached, look at it and use its actual visual content (code, error, UI, diagram, chart, screenshot, etc.) to inform the classification, title, topic and summary — describe what the image actually shows, not just that an image was sent. Return JSON with category (INCIDENT|TASK|DECISION|KNOWLEDGE|GENERAL_CHAT|NOISE), title, topic, summary, links, assignedTo, isTask. topic is a concise stable theme used to group a conversation; use the same topic for related messages. A question, recommendation, comparison, or conversation seeking an answer is GENERAL_CHAT, not KNOWLEDGE. KNOWLEDGE is only a reusable factual answer, guide, or reference. NOISE means no substance at all, regardless of length: bare acknowledgements/thanks ('ok', 'vale', 'gracias', 'dale'), greetings, emoji-only reactions, or messages fully unrelated to programming/AI/technology. A short message is NOT automatically NOISE if it reports a concrete technical fact, result, tool, model, cost, or experiment (e.g. 'Model X did Y in Z minutes for $W') — that is GENERAL_CHAT or KNOWLEDGE. An image attachment is never NOISE by itself. Do not invent facts.";
+const CLASSIFY_SYSTEM_PROMPT = "Classify a message from a WhatsApp group whose sole purpose is AI-assisted programming and technology topics (coding, tools, infra, models, dev workflows). If an image is attached, look at it and use its actual visual content (code, error, UI, diagram, chart, screenshot, etc.) to inform the classification, title, topic and summary — describe what the image actually shows, not just that an image was sent. Return JSON with category (INCIDENT|TASK|DECISION|KNOWLEDGE|GENERAL_CHAT|NOISE), title, topic, summary, links, assignedTo, isTask. topic is a concise stable theme used to group a conversation; use the same topic for related messages. A question, recommendation, comparison, or conversation seeking an answer is GENERAL_CHAT, not KNOWLEDGE. KNOWLEDGE is only a reusable factual answer, guide, or reference. NOISE means no substance at all, regardless of length: bare acknowledgements/thanks ('ok', 'vale', 'gracias', 'dale'), greetings, emoji-only reactions, or messages fully unrelated to programming/AI/technology. A short message is NOT automatically NOISE if it reports a concrete technical fact, result, tool, model, cost, or experiment (e.g. 'Model X did Y in Z minutes for $W') — that is GENERAL_CHAT or KNOWLEDGE. An opinion, critique, agreement, or disagreement about a technical/AI topic already being discussed in the recent context (e.g. commenting on bias in a shown ranking, disputing a claim, adding a counterpoint) is GENERAL_CHAT, not NOISE, even without hard data — it is a real contribution to the conversation. An image attachment is never NOISE by itself. Do not invent facts.";
 
-async function classify(content: string, imagePath?: string): Promise<Classification> {
-  const userContent: OpenAI.Chat.ChatCompletionContentPart[] = [{ type: "text", text: content }];
+async function recentContext(groupId: string, timestamp: Date): Promise<string> {
+  const recent = await prisma.deckMessage.findMany({
+    where: { groupId, timestamp: { lt: timestamp } },
+    orderBy: { timestamp: "desc" },
+    take: 4,
+    select: { senderName: true, content: true },
+  });
+  return recent.reverse().map((m) => `${m.senderName}: ${m.content}`).join("\n");
+}
+
+async function classify(content: string, imagePath?: string, context?: string): Promise<Classification> {
+  const text = context ? `Recent chat messages (oldest to newest, for context — the new message may be an implicit reply to one of these, e.g. answering a question or reacting to something just posted):\n${context}\n\nNew message to classify:\n${content}` : content;
+  const userContent: OpenAI.Chat.ChatCompletionContentPart[] = [{ type: "text", text }];
   if (imagePath) {
     try {
       const buffer = await readFile(imagePath);
@@ -69,25 +80,16 @@ async function refreshSummary(currentTitle: string, currentSummary: string | nul
   return JSON.parse(response.choices[0]?.message.content ?? "{}");
 }
 
-async function matchDiscussion(groupId: string, content: string, timestamp: Date) {
-  const [candidates, recent] = await Promise.all([
-    prisma.discussionThread.findMany({
-      where: { groupId, status: { in: ["ACTIVE", "PROPOSED"] } },
-      orderBy: { lastActivityAt: "desc" },
-      take: CANDIDATE_LIMIT,
-      select: { id: true, title: true, summary: true },
-    }),
-    prisma.deckMessage.findMany({
-      where: { groupId, timestamp: { lt: timestamp } },
-      orderBy: { timestamp: "desc" },
-      take: 4,
-      select: { senderName: true, content: true },
-    }),
-  ]);
+async function matchDiscussion(groupId: string, content: string, context: string) {
+  const candidates = await prisma.discussionThread.findMany({
+    where: { groupId, status: { in: ["ACTIVE", "PROPOSED"] } },
+    orderBy: { lastActivityAt: "desc" },
+    take: CANDIDATE_LIMIT,
+    select: { id: true, title: true, summary: true },
+  });
   if (!candidates.length) return null;
   const criteria: Record<string, string> = { [NEW_TOPIC]: "This message starts a new, unrelated discussion topic." };
   for (const c of candidates) criteria[c.id] = `${c.title}${c.summary ? ` — ${c.summary}` : ""}`.slice(0, 500);
-  const context = recent.reverse().map((m) => `${m.senderName}: ${m.content}`).join("\n");
   const state = context ? `Recent chat messages (oldest to newest, for context):\n${context}\n\nNew message to classify:\n${content}` : content;
   const { answers } = await typesafe.systemOne({
     state,
@@ -107,7 +109,8 @@ async function detectMentions(groupId: string, content: string): Promise<string[
 new Worker("message-enrichment", async (job) => {
   const input = IngestedMessageSchema.parse(job.data);
   const imagePath = input.media?.kind === "IMAGE" ? path.join(MEDIA_DIR, input.media.fileName) : undefined;
-  const classification = await classify(input.content, imagePath);
+  const context = await recentContext(input.groupId, new Date(input.timestamp));
+  const classification = await classify(input.content, imagePath, context);
   const category = (input.media && classification.category === "NOISE" ? "GENERAL_CHAT" : classification.category) as MessageCategory;
   await prisma.whatsAppGroup.upsert({
     where: { id: input.groupId },
@@ -116,7 +119,7 @@ new Worker("message-enrichment", async (job) => {
   });
   let isNewDiscussion = false;
   const discussion = category === "NOISE" ? null : await withGroupLock(input.groupId, async () => {
-    const matched = await matchDiscussion(input.groupId, input.content, new Date(input.timestamp));
+    const matched = await matchDiscussion(input.groupId, input.content, context);
     if (matched) {
       const refreshed = await refreshSummary(matched.title, matched.summary, input.content, imagePath);
       return prisma.discussionThread.update({ where: { id: matched.id }, data: { lastActivityAt: new Date(input.timestamp), title: refreshed.title ?? matched.title, summary: refreshed.summary ?? matched.summary } });
