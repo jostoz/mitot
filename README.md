@@ -41,6 +41,14 @@ The dashboard can run on Vercel. The API, worker, ingest client, PostgreSQL, Red
 
 Never commit `.env`, WhatsApp authentication directories, media storage, or production credentials.
 
+## Responsible use
+
+This repository is published for research, local experimentation, and integrations that are authorized by their respective platforms. It is not affiliated with, endorsed by, or supported by WhatsApp or Meta.
+
+The `services/ingest` Baileys listener is an experimental local component, not a hosted-product connector. Do not use it to collect third-party conversations, automate personal WhatsApp accounts, evade platform controls, or operate a service for other users. A hosted deployment must use approved integrations, such as the WhatsApp Business Platform / Cloud API, and must obtain the permissions, consent, and legal basis required for the data it processes.
+
+The MIT license provides the software without warranty; it does not make a use compliant with platform terms, privacy law, or other applicable law. Operators remain responsible for their own deployment, data handling, and compliance.
+
 ## Queue contracts
 
 - `message-enrichment`: validated WhatsApp group messages, delayed by `DEBOUNCE_MS` before classification.
