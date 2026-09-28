@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import { Bell, ChevronLeft, ChevronRight, Clock3, FileText, Home, MessageCircle, MoreHorizontal, Plus, Repeat2, Send, Sparkles, User, X } from "lucide-react";
+import { Bell, Check, ChevronLeft, ChevronRight, Clock3, FileText, Home, LayoutGrid, MessageCircle, MoreHorizontal, Repeat2, Send, Sparkles, User, X } from "lucide-react";
 import { type Discussion, type Group, type MediaInfo, type Notification, useDeckStore } from "./store";
 const API = "/api";
 const PALETTE = ["#7c6cff", "#ff6c8b", "#3ecf8e", "#f2b705", "#4ea1ff", "#ff9f4e"];
@@ -108,43 +108,43 @@ function Column({ colKey, items, selected, open, onHide }: { colKey: ColumnKey; 
   );
 }
 
-function AddColumnTile({ hidden, onAdd }: { hidden: ColumnKey[]; onAdd(key: ColumnKey): void }) {
-  const [open, setOpen] = useState(false);
+function MobileTabs({ visible, tab, setTab }: { visible: ColumnKey[]; tab: ColumnKey; setTab(key: ColumnKey): void }) {
   return (
-    <section className="relative flex h-full w-16 shrink-0 flex-col items-center border-r border-[#1c1c1e] pt-3">
-      <button onClick={() => setOpen(!open)} className="flex size-9 items-center justify-center rounded-full border border-dashed border-[#2f3336] text-[#71767b] hover:border-[#7c6cff] hover:text-[#7c6cff]"><Plus className="size-5" /></button>
-      {open && (
-        <div className="absolute left-2 top-14 z-10 w-48 rounded-xl border border-[#2f3336] bg-[#16181c] p-1 text-sm shadow-xl">
-          {hidden.length ? hidden.map((k) => (
-            <button key={k} onClick={() => { onAdd(k); setOpen(false); }} className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-white/[0.06]">{COLUMN_META[k].title}</button>
-          )) : <p className="px-2 py-1.5 text-[#5b5f63]">No hidden columns</p>}
-        </div>
-      )}
-    </section>
+    <div className="flex h-11 shrink-0 items-center overflow-x-auto border-b border-[#1c1c1e]">
+      {visible.map((key) => (
+        <button key={key} onClick={() => setTab(key)} className={`shrink-0 whitespace-nowrap border-b-2 px-4 py-2.5 text-[14px] font-medium ${tab === key ? "border-[#7c6cff] text-white" : "border-transparent text-[#71767b]"}`}>
+          {COLUMN_META[key].title}
+        </button>
+      ))}
+    </div>
   );
 }
 
-function MobileTabs({ visible, hidden, tab, setTab, onHide, onAdd }: { visible: ColumnKey[]; hidden: ColumnKey[]; tab: ColumnKey; setTab(key: ColumnKey): void; onHide(key: ColumnKey): void; onAdd(key: ColumnKey): void }) {
-  const [menu, setMenu] = useState(false);
+function ColumnsMenu({ order, hidden, onToggle }: { order: ColumnKey[]; hidden: ColumnKey[]; onToggle(key: ColumnKey): void }) {
+  const [open, setOpen] = useState(false);
   return (
-    <div className="relative flex h-11 shrink-0 items-center border-b border-[#1c1c1e]">
-      <div className="flex min-w-0 flex-1 overflow-x-auto">
-        {visible.map((key) => (
-          <button key={key} onClick={() => setTab(key)} className={`shrink-0 whitespace-nowrap border-b-2 px-4 py-2.5 text-[14px] font-medium ${tab === key ? "border-[#7c6cff] text-white" : "border-transparent text-[#71767b]"}`}>
-            {COLUMN_META[key].title}
-          </button>
-        ))}
-      </div>
-      <button onClick={() => setMenu(!menu)} className="flex h-11 w-11 shrink-0 items-center justify-center border-l border-[#1c1c1e] text-[#71767b]"><MoreHorizontal className="size-[18px]" /></button>
-      {menu && (
-        <div className="absolute right-2 top-11 z-20 w-48 rounded-xl border border-[#2f3336] bg-[#16181c] p-1 text-sm shadow-xl">
-          {hidden.length > 0 && hidden.map((k) => (
-            <button key={k} onClick={() => { onAdd(k); setMenu(false); }} className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-white/[0.06]"><Plus className="size-3.5" />{COLUMN_META[k].title}</button>
-          ))}
-          {visible.length > 1 && (
-            <button onClick={() => { onHide(tab); setMenu(false); }} className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[#ff6c8b] hover:bg-white/[0.06]"><X className="size-3.5" />Hide "{COLUMN_META[tab].title}"</button>
-          )}
-        </div>
+    <div className="relative">
+      <button onClick={() => setOpen(!open)} title="Columns" className="flex size-11 items-center justify-center rounded-full text-[#e7e9ea] hover:bg-white/[0.08] lg:size-10">
+        <LayoutGrid className="size-6" />
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          <div className="fixed bottom-16 left-2 right-2 z-20 rounded-xl border border-[#2f3336] bg-[#16181c] p-1 shadow-2xl lg:absolute lg:bottom-auto lg:left-14 lg:right-auto lg:top-0 lg:w-64">
+            <header className="px-3 py-2 text-xs font-semibold tracking-wide text-[#71767b]">COLUMNS</header>
+            {order.map((key) => {
+              const visible = !hidden.includes(key);
+              return (
+                <button key={key} onClick={() => onToggle(key)} className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm hover:bg-white/[0.06]">
+                  <span className={visible ? "" : "text-[#71767b]"}>{COLUMN_META[key].title}</span>
+                  <span className={`flex size-5 shrink-0 items-center justify-center rounded border ${visible ? "border-[#7c6cff] bg-[#7c6cff]" : "border-[#2f3336]"}`}>
+                    {visible && <Check className="size-3.5 text-black" />}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </>
       )}
     </div>
   );
@@ -256,13 +256,15 @@ export default function Page() {
     markNotificationRead(id);
     await fetch(`${API}/notifications/${id}`, { method: "PATCH" });
   }
-  function hide(key: ColumnKey) {
-    setHidden((h) => [...h, key]);
-    setTab((current) => (current === key ? order.find((k) => k !== key && !hidden.includes(k)) ?? "active" : current));
-  }
-  function add(key: ColumnKey) {
-    setHidden((h) => h.filter((k) => k !== key));
-    setTab(key);
+  function toggleColumn(key: ColumnKey) {
+    const willHide = !hidden.includes(key);
+    setHidden((h) => (h.includes(key) ? h.filter((k) => k !== key) : [...h, key]));
+    if (willHide && tab === key) {
+      const next = order.find((k) => k !== key && !hidden.includes(k));
+      if (next) setTab(next);
+    } else if (!willHide) {
+      setTab(key);
+    }
   }
 
   if (!group) return <main className="grid min-h-screen place-items-center bg-black text-[#71767b]">Loading Mitot…</main>;
@@ -307,19 +309,19 @@ export default function Page() {
       <nav className="fixed inset-x-0 bottom-0 z-30 flex h-14 shrink-0 items-center justify-around border-t border-[#1c1c1e] bg-black lg:static lg:h-auto lg:w-16 lg:flex-col lg:justify-start lg:gap-2 lg:border-t-0 lg:border-r lg:py-4">
         <div className="hidden size-9 items-center justify-center rounded-full bg-[#7c6cff] text-sm font-bold text-black lg:mb-2 lg:flex">M</div>
         <button title={group.name} className="flex size-11 items-center justify-center rounded-full text-[#e7e9ea] hover:bg-white/[0.08] lg:size-10"><Home className="size-6" /></button>
+        <ColumnsMenu order={order} hidden={hidden} onToggle={toggleColumn} />
         <NotificationBell notifications={notifications} onOpen={(id) => id && open(id)} onRead={markRead} />
         <button title="Profile" className="flex size-11 items-center justify-center rounded-full text-[#e7e9ea] hover:bg-white/[0.08] lg:size-10"><User className="size-6" /></button>
       </nav>
       <div className="flex min-h-0 flex-1 pb-14 lg:pb-0">
         <div className="flex min-h-0 w-full min-w-0 flex-col lg:hidden">
-          <MobileTabs visible={visible} hidden={hidden} tab={tab} setTab={setTab} onHide={hide} onAdd={add} />
+          <MobileTabs visible={visible} tab={tab} setTab={setTab} />
           <ColumnBody items={itemsByKey[tab]} selected={selected ?? undefined} open={open} />
         </div>
         <div ref={columnsRef} className="hidden min-w-0 flex-1 overflow-x-auto lg:flex">
           {visible.map((key) => (
-            <Column key={key} colKey={key} items={itemsByKey[key]} selected={selected ?? undefined} open={open} onHide={() => hide(key)} />
+            <Column key={key} colKey={key} items={itemsByKey[key]} selected={selected ?? undefined} open={open} onHide={() => toggleColumn(key)} />
           ))}
-          <AddColumnTile hidden={hidden} onAdd={add} />
         </div>
         {active && (
           <aside className={`fixed inset-0 z-40 flex flex-col overflow-hidden bg-black lg:static lg:z-auto lg:shrink-0 lg:border-l lg:border-[#1c1c1e] lg:transition-[width] lg:duration-300 lg:ease-out ${expanded ? "lg:w-[420px]" : "lg:w-12"}`}>
