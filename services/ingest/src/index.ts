@@ -1,10 +1,12 @@
 import { createServer } from "node:http";
-import { DisconnectReason, fetchLatestBaileysVersion, makeWASocket, useMultiFileAuthState, type GroupMetadata } from "@whiskeysockets/baileys";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { DisconnectReason, downloadMediaMessage, fetchLatestBaileysVersion, makeWASocket, useMultiFileAuthState, type GroupMetadata, type WAMessage } from "@whiskeysockets/baileys";
 import { Queue, Worker } from "bullmq";
 import { Redis } from "ioredis";
 import P from "pino";
 import QRCode from "qrcode";
-import { IngestedMessageSchema } from "@deck/contracts";
+import { IngestedMessageSchema, type IngestedMedia, type MediaKind } from "@deck/contracts";
 
 const redis = new Redis(process.env.REDIS_URL ?? "redis://localhost:6379", { maxRetriesPerRequest: null });
 const enrichmentQueue = new Queue("message-enrichment", { connection: redis });
@@ -13,6 +15,9 @@ const TARGET_GROUPS = new Set((process.env.WHATSAPP_GROUP_IDS ?? "").split(",").
 const DEBOUNCE_MS = Number(process.env.DEBOUNCE_MS ?? 1500);
 let pairingQrSvg = "";
 const GROUP_NAMES = new Map<string, string>();
+const MEDIA_DIR = process.env.MEDIA_STORAGE_DIR ?? path.resolve(process.cwd(), "..", "..", "media-storage");
+const MEDIA_KIND_BY_FIELD: Record<string, MediaKind> = { imageMessage: "IMAGE", videoMessage: "VIDEO", audioMessage: "AUDIO", documentMessage: "DOCUMENT", stickerMessage: "STICKER" };
+const MEDIA_PLACEHOLDER: Record<MediaKind, string> = { IMAGE: "[Imagen]", VIDEO: "[Video]", AUDIO: "[Nota de voz]", DOCUMENT: "[Documento]", STICKER: "[Sticker]" };
 createServer((request, response) => {
   if (request.url === "/qr.svg") {
     response.writeHead(pairingQrSvg ? 200 : 204, { "cache-control": "no-store", "content-type": "image/svg+xml" });
@@ -23,16 +28,47 @@ createServer((request, response) => {
   response.end('<!doctype html><title>WhatsApp pairing</title><meta http-equiv="refresh" content="5"><main style="display:grid;place-items:center;height:100vh;font:20px system-ui;background:#111;color:#fff"><div><h1>Scan with WhatsApp</h1><img src="/qr.svg" width="480" height="480" alt="WhatsApp pairing QR"><p>WhatsApp → Linked devices → Link a device</p></div></main>');
 }).listen(Number(process.env.QR_PORT ?? 3002), "127.0.0.1", () => console.log("Open http://localhost:3002 to scan the WhatsApp QR."));
 
-function messageText(message: Record<string, unknown>): string | undefined {
-  const content = (message.ephemeralMessage as { message?: Record<string, unknown> } | undefined)?.message ?? message;
-  if (typeof content.conversation === "string") return content.conversation;
+function unwrapContent(message: Record<string, unknown>): Record<string, unknown> {
+  return (message.ephemeralMessage as { message?: Record<string, unknown> } | undefined)?.message ?? message;
+}
+
+function captionText(content: Record<string, unknown>): string | undefined {
+  if (typeof content.conversation === "string" && content.conversation.length > 0) return content.conversation;
   const extendedText = content.extendedTextMessage;
-  if (extendedText && typeof extendedText === "object" && "text" in extendedText && typeof extendedText.text === "string") return extendedText.text;
+  if (extendedText && typeof extendedText === "object" && "text" in extendedText && typeof extendedText.text === "string" && extendedText.text.length > 0) return extendedText.text;
   for (const key of ["imageMessage", "videoMessage", "documentMessage"] as const) {
     const media = content[key];
-    if (media && typeof media === "object" && "caption" in media && typeof media.caption === "string") return media.caption;
+    if (media && typeof media === "object" && "caption" in media && typeof media.caption === "string" && media.caption.length > 0) return media.caption;
   }
   return undefined;
+}
+
+function extensionFromMime(mime: string): string {
+  const sub = mime.split(";")[0]?.split("/")[1] ?? "bin";
+  return sub === "jpeg" ? "jpg" : sub.replace(/[^a-z0-9]/gi, "");
+}
+
+function detectMedia(content: Record<string, unknown>): { field: string; kind: MediaKind; media: Record<string, unknown> } | undefined {
+  for (const field of Object.keys(MEDIA_KIND_BY_FIELD)) {
+    const media = content[field];
+    if (media && typeof media === "object") return { field, kind: MEDIA_KIND_BY_FIELD[field]!, media: media as Record<string, unknown> };
+  }
+  return undefined;
+}
+
+async function saveMedia(message: WAMessage, detected: { field: string; kind: MediaKind; media: Record<string, unknown> }, messageId: string): Promise<IngestedMedia | undefined> {
+  try {
+    const mimeType = typeof detected.media.mimetype === "string" ? detected.media.mimetype : "application/octet-stream";
+    const extension = extensionFromMime(mimeType);
+    const fileName = `${messageId}.${extension}`;
+    const buffer = await downloadMediaMessage(message, "buffer", {});
+    await mkdir(MEDIA_DIR, { recursive: true });
+    await writeFile(path.join(MEDIA_DIR, fileName), buffer);
+    return { kind: detected.kind, fileName, mimeType, sizeBytes: buffer.length };
+  } catch (error) {
+    console.error(`Failed to download media for message ${messageId}:`, error);
+    return undefined;
+  }
 }
 
 async function start() {
@@ -68,25 +104,33 @@ async function start() {
   socket.ev.on("messages.upsert", ({ messages, type }) => {
     console.log(`WhatsApp messages.upsert: type=${type}, count=${messages.length}.`);
     for (const message of messages) {
-      try {
-        const groupId = message.key.remoteJid;
-        const text = message.message ? messageText(message.message as Record<string, unknown>) : undefined;
-        const shouldProcess = type === "notify" || Boolean(message.key.fromMe);
-        const isTargetGroup = Boolean(groupId?.endsWith("@g.us") && (TARGET_GROUPS.size === 0 || TARGET_GROUPS.has(groupId)));
-        console.log(`WhatsApp message: group=${groupId ?? "none"} target=${isTargetGroup} text=${Boolean(text)} accepted=${shouldProcess && isTargetGroup && Boolean(text)}.`);
-        if (!shouldProcess || !isTargetGroup || !text || !groupId) continue;
-        const payload = IngestedMessageSchema.parse({
-          id: message.key.id, groupId, groupName: GROUP_NAMES.get(groupId) ?? groupId, senderJid: message.key.participant ?? groupId,
-          senderName: message.pushName ?? "Unknown", content: text,
-          parentMessageId: (message.message?.extendedTextMessage?.contextInfo?.stanzaId),
-          timestamp: new Date(Number(message.messageTimestamp) * 1000).toISOString(), isOutbound: Boolean(message.key.fromMe),
-        });
-        void enrichmentQueue.add("enrich", payload, { jobId: payload.id, delay: DEBOUNCE_MS, removeOnComplete: 1000, removeOnFail: 5000 });
-      } catch (error) {
-        console.error("Failed to process incoming WhatsApp message, skipping it:", error);
-      }
+      void (async () => {
+        try {
+          const groupId = message.key.remoteJid;
+          const shouldProcess = type === "notify" || Boolean(message.key.fromMe);
+          const isTargetGroup = Boolean(groupId?.endsWith("@g.us") && (TARGET_GROUPS.size === 0 || TARGET_GROUPS.has(groupId)));
+          if (!shouldProcess || !isTargetGroup || !groupId || !message.message || !message.key.id) return;
+          const content = unwrapContent(message.message as Record<string, unknown>);
+          const text = captionText(content);
+          const detected = detectMedia(content);
+          const media = detected ? await saveMedia(message, detected, message.key.id) : undefined;
+          console.log(`WhatsApp message: group=${groupId} text=${Boolean(text)} media=${media?.kind ?? "none"} accepted=${Boolean(text || media)}.`);
+          if (!text && !media) return;
+          const payload = IngestedMessageSchema.parse({
+            id: message.key.id, groupId, groupName: GROUP_NAMES.get(groupId) ?? groupId, senderJid: message.key.participant ?? groupId,
+            senderName: message.pushName ?? "Unknown", content: text || MEDIA_PLACEHOLDER[media!.kind],
+            parentMessageId: (message.message?.extendedTextMessage?.contextInfo?.stanzaId),
+            timestamp: new Date(Number(message.messageTimestamp) * 1000).toISOString(), isOutbound: Boolean(message.key.fromMe),
+            media,
+          });
+          void enrichmentQueue.add("enrich", payload, { jobId: payload.id, delay: DEBOUNCE_MS, removeOnComplete: 1000, removeOnFail: 5000 });
+        } catch (error) {
+          console.error("Failed to process incoming WhatsApp message, skipping it:", error);
+        }
+      })();
     }
   });
+
 
   new Worker("whatsapp-outbound", async (job) => {
     const payload = job.data as { groupId: string; content: string; parentMessageId?: string };

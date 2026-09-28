@@ -1,8 +1,10 @@
 import cors from "@fastify/cors";
+import staticPlugin from "@fastify/static";
 import websocket from "@fastify/websocket";
 import Fastify from "fastify";
 import { Queue } from "bullmq";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { Redis } from "ioredis";
 import { z } from "zod";
 import { prisma } from "@deck/database";
@@ -14,7 +16,7 @@ const outbound = new Queue("whatsapp-outbound", { connection: redis });
 const enrichment = new Queue("message-enrichment", { connection: redis });
 const clients = new Set<{ send(data: string): void; readyState: number }>();
 const ReplySchema = z.object({ content: z.string().trim().min(1).max(4096), parentMessageId: z.string().min(1).optional() });
-const DiscussionUpdateSchema = z.object({ status: z.enum(["PROPOSED", "ACTIVE", "RESOLVED", "ARCHIVED"]).optional(), ownerName: z.string().trim().min(1).max(120).nullable().optional(), nextAction: z.string().trim().min(1).max(4096).nullable().optional(), followUpAt: z.coerce.date().nullable().optional(), priority: z.enum(["LOW", "MEDIUM", "HIGH", "URGENT"]).nullable().optional() }).refine((value) => Object.keys(value).length > 0);
+const DiscussionUpdateSchema = z.object({ status: z.enum(["PROPOSED", "ACTIVE"]).optional(), ownerName: z.string().trim().min(1).max(120).nullable().optional(), nextAction: z.string().trim().min(1).max(4096).nullable().optional(), followUpAt: z.coerce.date().nullable().optional(), priority: z.enum(["LOW", "MEDIUM", "HIGH", "URGENT"]).nullable().optional() }).refine((value) => Object.keys(value).length > 0);
 const ManualMessageSchema = z.object({
   senderName: z.string().trim().min(1).max(120),
   content: z.string().trim().min(1).max(4096),
@@ -23,6 +25,11 @@ const ManualMessageSchema = z.object({
 
 await app.register(cors, { origin: process.env.WEB_ORIGIN?.split(",") ?? true });
 await app.register(websocket);
+await app.register(staticPlugin, { root: process.env.MEDIA_STORAGE_DIR ?? path.resolve(process.cwd(), "..", "..", "media-storage"), prefix: "/media/" });
+app.setErrorHandler((error, _request, reply) => {
+  if (error instanceof z.ZodError) return reply.code(400).send({ error: "Invalid request", issues: error.issues });
+  return reply.send(error);
+});
 
 app.get("/health", async () => ({ ok: true }));
 app.get("/groups", async () => prisma.whatsAppGroup.findMany({ where: { isActive: true }, orderBy: { name: "asc" }, include: { columns: { orderBy: { createdAt: "asc" } } } }));
@@ -71,6 +78,19 @@ app.patch("/discussions/:id", async (request, reply) => {
   const { id } = request.params as { id: string };
   const data = DiscussionUpdateSchema.parse(request.body);
   return reply.send(await prisma.discussionThread.update({ where: { id }, data }));
+});
+app.get("/groups/:groupId/notifications", async (request) => {
+  const { groupId } = request.params as { groupId: string };
+  const query = request.query as { unreadOnly?: string };
+  return prisma.notification.findMany({
+    where: { groupId, ...(query.unreadOnly === "true" ? { read: false } : {}) },
+    orderBy: { createdAt: "desc" },
+    take: 100,
+  });
+});
+app.patch("/notifications/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  return reply.send(await prisma.notification.update({ where: { id }, data: { read: true } }));
 });
 app.get("/events", { websocket: true }, (socket) => {
   clients.add(socket);

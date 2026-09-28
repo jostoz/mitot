@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { Worker } from "bullmq";
 import { Redis } from "ioredis";
 import OpenAI from "openai";
@@ -13,6 +15,7 @@ const MATCH_CONFIDENCE_THRESHOLD = Number(process.env.DISCUSSION_MATCH_THRESHOLD
 const CANDIDATE_LIMIT = 12;
 const NEW_TOPIC = "new_topic";
 const COLUMN_TITLES: Record<string, string> = { INCIDENT: "🛠️ Problemas técnicos", TASK: "🚀 Proyectos y colaboraciones", DECISION: "📣 Decisiones de comunidad", KNOWLEDGE: "📚 Recursos y referencias", GENERAL_CHAT: "💬 Hilos abiertos", NOISE: "🔇 Noise" };
+const MEDIA_DIR = process.env.MEDIA_STORAGE_DIR ?? path.resolve(process.cwd(), "..", "..", "media-storage");
 
 const groupLocks = new Map<string, Promise<unknown>>();
 function withGroupLock<T>(groupId: string, fn: () => Promise<T>): Promise<T> {
@@ -23,22 +26,44 @@ function withGroupLock<T>(groupId: string, fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
-async function classify(content: string): Promise<Classification> {
+const CLASSIFY_SYSTEM_PROMPT = "Classify a message from a WhatsApp group whose sole purpose is AI-assisted programming and technology topics (coding, tools, infra, models, dev workflows). If an image is attached, look at it and use its actual visual content (code, error, UI, diagram, chart, screenshot, etc.) to inform the classification, title, topic and summary — describe what the image actually shows, not just that an image was sent. Return JSON with category (INCIDENT|TASK|DECISION|KNOWLEDGE|GENERAL_CHAT|NOISE), title, topic, summary, links, assignedTo, isTask. topic is a concise stable theme used to group a conversation; use the same topic for related messages. A question, recommendation, comparison, or conversation seeking an answer is GENERAL_CHAT, not KNOWLEDGE. KNOWLEDGE is only a reusable factual answer, guide, or reference. NOISE means no substance at all, regardless of length: bare acknowledgements/thanks ('ok', 'vale', 'gracias', 'dale'), greetings, emoji-only reactions, or messages fully unrelated to programming/AI/technology. A short message is NOT automatically NOISE if it reports a concrete technical fact, result, tool, model, cost, or experiment (e.g. 'Model X did Y in Z minutes for $W') — that is GENERAL_CHAT or KNOWLEDGE. An image attachment is never NOISE by itself. Do not invent facts.";
+
+async function classify(content: string, imagePath?: string): Promise<Classification> {
+  const userContent: OpenAI.Chat.ChatCompletionContentPart[] = [{ type: "text", text: content }];
+  if (imagePath) {
+    try {
+      const buffer = await readFile(imagePath);
+      const ext = path.extname(imagePath).slice(1) || "jpeg";
+      userContent.push({ type: "image_url", image_url: { url: `data:image/${ext};base64,${buffer.toString("base64")}` } });
+    } catch (error) {
+      console.error(`Failed to read image for classification at ${imagePath}:`, error);
+    }
+  }
   const response = await openai.chat.completions.create({
     model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
     response_format: { type: "json_object" },
-    messages: [{ role: "system", content: "Classify a message from a WhatsApp group whose sole purpose is AI-assisted programming and technology topics (coding, tools, infra, models, dev workflows). Return JSON with category (INCIDENT|TASK|DECISION|KNOWLEDGE|GENERAL_CHAT|NOISE), title, topic, summary, links, assignedTo, isTask. topic is a concise stable theme used to group a conversation; use the same topic for related messages. A question, recommendation, comparison, or conversation seeking an answer is GENERAL_CHAT, not KNOWLEDGE. KNOWLEDGE is only a reusable factual answer, guide, or reference. NOISE means no substance at all, regardless of length: bare acknowledgements/thanks ('ok', 'vale', 'gracias', 'dale'), greetings, emoji-only reactions, or messages fully unrelated to programming/AI/technology. A short message is NOT automatically NOISE if it reports a concrete technical fact, result, tool, model, cost, or experiment (e.g. 'Model X did Y in Z minutes for $W') — that is GENERAL_CHAT or KNOWLEDGE. Do not invent facts." }, { role: "user", content }],
+    messages: [{ role: "system", content: CLASSIFY_SYSTEM_PROMPT }, { role: "user", content: userContent }],
   });
   return ClassificationSchema.parse(JSON.parse(response.choices[0]?.message.content ?? "{}"));
 }
 
-async function refreshSummary(currentTitle: string, currentSummary: string | null, newMessage: string): Promise<{ title: string; summary: string }> {
+async function refreshSummary(currentTitle: string, currentSummary: string | null, newMessage: string, imagePath?: string): Promise<{ title: string; summary: string }> {
+  const userContent: OpenAI.Chat.ChatCompletionContentPart[] = [{ type: "text", text: JSON.stringify({ currentTitle, currentSummary, newMessage }) }];
+  if (imagePath) {
+    try {
+      const buffer = await readFile(imagePath);
+      const ext = path.extname(imagePath).slice(1) || "jpeg";
+      userContent.push({ type: "image_url", image_url: { url: `data:image/${ext};base64,${buffer.toString("base64")}` } });
+    } catch (error) {
+      console.error(`Failed to read image for summary refresh at ${imagePath}:`, error);
+    }
+  }
   const response = await openai.chat.completions.create({
     model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
     response_format: { type: "json_object" },
     messages: [
-      { role: "system", content: "You maintain a running {title, summary} for an ongoing WhatsApp discussion thread. Given the current title/summary and a new message just added to the thread, return updated JSON {title, summary}. title: concise (max 10 words), must reflect the actual purpose/question of the WHOLE thread so far (not just the newest message), in the thread's language. summary: 1-2 sentences covering the thread so far, same language. Keep them stable unless the new message adds meaningful context that changes what the thread is really about." },
-      { role: "user", content: JSON.stringify({ currentTitle, currentSummary, newMessage }) },
+      { role: "system", content: "You maintain a running {title, summary} for an ongoing WhatsApp discussion thread. Given the current title/summary and a new message just added to the thread, return updated JSON {title, summary}. If an image is attached, use its actual visual content to inform the update. title: concise (max 10 words), must reflect the actual purpose/question of the WHOLE thread so far (not just the newest message), in the thread's language. summary: 1-2 sentences covering the thread so far, same language. Keep them stable unless the new message adds meaningful context that changes what the thread is really about." },
+      { role: "user", content: userContent },
     ],
   });
   return JSON.parse(response.choices[0]?.message.content ?? "{}");
@@ -72,21 +97,31 @@ async function matchDiscussion(groupId: string, content: string, timestamp: Date
   if (pick === NEW_TOPIC || confidence < MATCH_CONFIDENCE_THRESHOLD) return null;
   return candidates.find((c) => c.id === pick) ?? null;
 }
+async function detectMentions(groupId: string, content: string): Promise<string[]> {
+  const handles = [...content.matchAll(/@([\p{L}\p{N}_.]{2,40})/gu)].map((m) => m[1]!.toLowerCase());
+  if (!handles.length) return [];
+  const senders = await prisma.deckMessage.findMany({ where: { groupId }, distinct: ["senderName"], select: { senderName: true }, take: 500 });
+  return senders.map((s) => s.senderName).filter((name) => handles.some((h) => name.toLowerCase().includes(h) || h.includes(name.toLowerCase().replace(/\s+/g, ""))));
+}
+
 new Worker("message-enrichment", async (job) => {
   const input = IngestedMessageSchema.parse(job.data);
-  const classification = await classify(input.content);
-  const category = classification.category as MessageCategory;
+  const imagePath = input.media?.kind === "IMAGE" ? path.join(MEDIA_DIR, input.media.fileName) : undefined;
+  const classification = await classify(input.content, imagePath);
+  const category = (input.media && classification.category === "NOISE" ? "GENERAL_CHAT" : classification.category) as MessageCategory;
   await prisma.whatsAppGroup.upsert({
     where: { id: input.groupId },
     create: { id: input.groupId, name: input.groupName },
     update: input.groupName === input.groupId ? {} : { name: input.groupName },
   });
+  let isNewDiscussion = false;
   const discussion = category === "NOISE" ? null : await withGroupLock(input.groupId, async () => {
     const matched = await matchDiscussion(input.groupId, input.content, new Date(input.timestamp));
     if (matched) {
-      const refreshed = await refreshSummary(matched.title, matched.summary, input.content);
+      const refreshed = await refreshSummary(matched.title, matched.summary, input.content, imagePath);
       return prisma.discussionThread.update({ where: { id: matched.id }, data: { lastActivityAt: new Date(input.timestamp), title: refreshed.title ?? matched.title, summary: refreshed.summary ?? matched.summary } });
     }
+    isNewDiscussion = true;
     return prisma.discussionThread.create({
       data: {
         groupId: input.groupId, topicKey: randomUUID(), title: classification.topic, summary: classification.summary,
@@ -104,11 +139,49 @@ new Worker("message-enrichment", async (job) => {
     create: {
       id: input.id, groupId: input.groupId, columnId: column.id, discussionId: discussion?.id ?? null, senderJid: input.senderJid, senderName: input.senderName,
       content: input.content, category, parentMessageId: input.parentMessageId, isOutbound: input.isOutbound, timestamp: new Date(input.timestamp),
-      metadata: { title: classification.title, topic: classification.topic, summary: classification.summary, links: classification.links, assignedTo: classification.assignedTo, isTask: classification.isTask, audioUrl: input.audioUrl },
+      metadata: { title: classification.title, topic: classification.topic, summary: classification.summary, links: classification.links, assignedTo: classification.assignedTo, isTask: classification.isTask, media: input.media },
     },
     update: {},
   });
+  if (input.media) {
+    await prisma.mediaAsset.upsert({
+      where: { messageId: saved.id },
+      create: { messageId: saved.id, kind: input.media.kind, mimeType: input.media.mimeType, fileName: input.media.fileName, sizeBytes: input.media.sizeBytes },
+      update: {},
+    });
+  }
   await redis.publish("deck-events", JSON.stringify({ type: "message.created", message: { ...saved, timestamp: saved.timestamp.toISOString() } }));
+
+  if (isNewDiscussion && discussion) {
+    const notification = await prisma.notification.create({
+      data: { groupId: input.groupId, type: "NEW_DISCUSSION", title: `Nueva discusión: ${discussion.title}`, body: discussion.summary, discussionId: discussion.id },
+    });
+    await redis.publish("deck-events", JSON.stringify({ type: "notification.created", notification: { ...notification, createdAt: notification.createdAt.toISOString() } }));
+  }
+  if (discussion && category !== "NOISE") {
+    const mentioned = await detectMentions(input.groupId, input.content);
+    for (const name of mentioned) {
+      const notification = await prisma.notification.create({
+        data: { groupId: input.groupId, type: "MENTION", title: `${input.senderName} mencionó a ${name}`, body: input.content.slice(0, 280), discussionId: discussion.id },
+      });
+      await redis.publish("deck-events", JSON.stringify({ type: "notification.created", notification: { ...notification, createdAt: notification.createdAt.toISOString() } }));
+    }
+  }
 }, { connection: redis, concurrency: Number(process.env.WORKER_CONCURRENCY ?? 4) });
+
+setInterval(async () => {
+  try {
+    const due = await prisma.discussionThread.findMany({ where: { followUpAt: { lte: new Date() }, status: "ACTIVE" }, select: { id: true, groupId: true, title: true, nextAction: true } });
+    for (const d of due) {
+      const notification = await prisma.notification.create({
+        data: { groupId: d.groupId, type: "FOLLOW_UP_DUE", title: `Follow-up vencido: ${d.title}`, body: d.nextAction, discussionId: d.id },
+      });
+      await prisma.discussionThread.update({ where: { id: d.id }, data: { followUpAt: null } });
+      await redis.publish("deck-events", JSON.stringify({ type: "notification.created", notification: { ...notification, createdAt: notification.createdAt.toISOString() } }));
+    }
+  } catch (error) {
+    console.error("Follow-up due check failed:", error);
+  }
+}, 60_000);
 
 process.once("SIGINT", async () => { await Promise.all([prisma.$disconnect(), redis.quit()]); process.exit(0); });

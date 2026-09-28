@@ -11,6 +11,9 @@ dist/
 .wa-auth/
 **/.wa-auth/
 
+media-storage/
+**/media-storage/
+
 *.log
 npm-debug.log*
 

@@ -27,6 +27,18 @@ enum DiscussionVisibility {
   MEMBERS
   PUBLIC
 }
+enum MediaKind {
+  IMAGE
+  VIDEO
+  AUDIO
+  DOCUMENT
+  STICKER
+}
+enum NotificationType {
+  MENTION
+  FOLLOW_UP_DUE
+  NEW_DISCUSSION
+}
 
 
 model User {
@@ -46,6 +58,7 @@ model WhatsAppGroup {
   columns     DeckColumn[]
   messages    DeckMessage[]
   discussions DiscussionThread[]
+  notifications Notification[]
   createdAt   DateTime           @default(now())
 }
 
@@ -77,6 +90,7 @@ model DiscussionThread {
   followUpAt     DateTime?
   priority       String?
   messages       DeckMessage[]
+  notifications  Notification[]
   lastActivityAt DateTime
   createdAt      DateTime         @default(now())
   updatedAt      DateTime         @updatedAt
@@ -103,9 +117,36 @@ model DeckMessage {
   metadata        Json?
   isOutbound      Boolean           @default(false)
   timestamp       DateTime
+  media           MediaAsset?
   createdAt       DateTime          @default(now())
 
   @@index([groupId, columnId, createdAt(sort: Desc)])
   @@index([discussionId, createdAt(sort: Desc)])
   @@index([parentMessageId])
+}
+
+model MediaAsset {
+  id        String      @id @default(uuid())
+  messageId String      @unique
+  message   DeckMessage @relation(fields: [messageId], references: [id])
+  kind      MediaKind
+  mimeType  String
+  fileName  String
+  sizeBytes Int
+  createdAt DateTime    @default(now())
+}
+
+model Notification {
+  id           String            @id @default(uuid())
+  groupId      String
+  group        WhatsAppGroup     @relation(fields: [groupId], references: [id])
+  type         NotificationType
+  title        String
+  body         String?           @db.Text
+  discussionId String?
+  discussion   DiscussionThread? @relation(fields: [discussionId], references: [id])
+  read         Boolean           @default(false)
+  createdAt    DateTime          @default(now())
+
+  @@index([groupId, read, createdAt(sort: Desc)])
 }

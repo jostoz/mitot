@@ -3,6 +3,17 @@ import { z } from "zod";
 export const messageCategories = ["INCIDENT", "TASK", "DECISION", "KNOWLEDGE", "GENERAL_CHAT", "NOISE"] as const;
 export const MessageCategorySchema = z.enum(messageCategories);
 
+export const mediaKinds = ["IMAGE", "VIDEO", "AUDIO", "DOCUMENT", "STICKER"] as const;
+export const MediaKindSchema = z.enum(mediaKinds);
+export type MediaKind = z.infer<typeof MediaKindSchema>;
+export const IngestedMediaSchema = z.object({
+  kind: MediaKindSchema,
+  fileName: z.string().min(1),
+  mimeType: z.string().min(1),
+  sizeBytes: z.number().int().nonnegative(),
+});
+export type IngestedMedia = z.infer<typeof IngestedMediaSchema>;
+
 export const IngestedMessageSchema = z.object({
   id: z.string().min(1),
   groupId: z.string().endsWith("@g.us"),
@@ -13,7 +24,7 @@ export const IngestedMessageSchema = z.object({
   parentMessageId: z.string().optional(),
   timestamp: z.string().datetime(),
   isOutbound: z.boolean().default(false),
-  audioUrl: z.string().url().optional(),
+  media: IngestedMediaSchema.optional(),
 });
 export type IngestedMessage = z.infer<typeof IngestedMessageSchema>;
 
