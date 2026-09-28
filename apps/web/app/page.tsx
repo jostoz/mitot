@@ -203,17 +203,34 @@ export default function Page() {
       groupIdRef.current = groups[0].id;
       await Promise.all([loadDiscussions(groups[0].id), loadNotifications(groups[0].id)]);
     })();
-    const url = new URL(`${API}/events`, window.location.origin);
-    url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(url);
-    let timer: number | undefined;
-    ws.onmessage = (event) => {
-      if (!groupIdRef.current) return;
-      const parsed = JSON.parse(event.data) as { type: string; notification?: Notification };
-      if (parsed.type === "notification.created" && parsed.notification) addNotification(parsed.notification);
-      clearTimeout(timer);
-      timer = window.setTimeout(() => void loadDiscussions(groupIdRef.current!), 500);
-    };
+    let ws: WebSocket | undefined;
+    let reconnectTimer: number | undefined;
+    let debounceTimer: number | undefined;
+    let closedByCleanup = false;
+    let attempt = 0;
+    function connect() {
+      const url = new URL(`${API}/events`, window.location.origin);
+      url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(url);
+      ws.onopen = () => { attempt = 0; };
+      ws.onmessage = (event) => {
+        if (!groupIdRef.current) return;
+        const parsed = JSON.parse(event.data) as { type: string; notification?: Notification };
+        if (parsed.type === "notification.created" && parsed.notification) addNotification(parsed.notification);
+        clearTimeout(debounceTimer);
+        debounceTimer = window.setTimeout(() => void loadDiscussions(groupIdRef.current!), 500);
+      };
+      ws.onclose = () => {
+        if (closedByCleanup) return;
+        attempt += 1;
+        reconnectTimer = window.setTimeout(connect, Math.min(1000 * 2 ** attempt, 15000));
+      };
+      ws.onerror = () => ws?.close();
+    }
+    connect();
+    const pollTimer = window.setInterval(() => {
+      if (groupIdRef.current) void loadDiscussions(groupIdRef.current);
+    }, 20000);
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       setExpanded((wasExpanded) => {
@@ -223,7 +240,14 @@ export default function Page() {
       });
     };
     window.addEventListener("keydown", onKeyDown);
-    return () => { ws.close(); clearTimeout(timer); window.removeEventListener("keydown", onKeyDown); };
+    return () => {
+      closedByCleanup = true;
+      ws?.close();
+      clearTimeout(reconnectTimer);
+      clearTimeout(debounceTimer);
+      clearInterval(pollTimer);
+      window.removeEventListener("keydown", onKeyDown);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   useEffect(() => {
